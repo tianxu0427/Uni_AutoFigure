@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoFigure-Edit Import</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body data-page="import">
+    <div class="page">
+      <header class="topbar">
+        <div>
+          <div class="brand">
+            <img class="brand-logo" src="/favicon.svg" alt="DeepScientist logo" />
+            <span id="importBrandTitle">Import Stage-1 Figure</span>
+          </div>
+          <div class="subtitle" id="importPageSubtitle">
+            Skip step 1 generation and continue from an existing academic figure.
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <a class="ghost topbar-link" id="importGuideBtn" href="/guide.html">I don't know how to fill this</a>
+          <a class="ghost topbar-link history-action" id="importHistoryBtn" href="/history.html">History</a>
+          <a class="ghost topbar-link" id="importBackLink" href="/">Back to Method Workflow</a>
+          <div class="lang-switch" data-lang-switch>
+            <button type="button" class="lang-chip" data-lang="zh">中文</button>
+            <button type="button" class="lang-chip" data-lang="en">EN</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="input-layout">
+        <section class="card">
+          <div class="field-group">
+            <label class="field-label" id="importFigureLabel" for="importFigureFile">Stage-1 Figure</label>
+            <div class="upload-zone" id="importUploadZone">
+              <input id="importFigureFile" class="file-input" type="file" accept="image/*" />
+              <div class="upload-text" id="importUploadText">
+                Drop the first-stage academic figure here or click to upload
+              </div>
+            </div>
+            <div class="hint" id="importFigureHint">
+              This image becomes <code>figure.png</code>. The pipeline will start from SAM
+              segmentation and SVG reconstruction.
+            </div>
+          </div>
+
+          <div class="field-group">
+            <img id="importFigurePreview" class="stage-preview" alt="Imported figure preview" />
+            <div id="importFigureStatus" class="hint"></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="field-group">
+            <div class="field-header">
+              <label class="field-label" id="importRouteLabel">Import Route</label>
+              <div class="field-caption" id="importRouteCaption">Only SAM and SVG stages remain in this workflow.</div>
+            </div>
+            <div class="route-summary">
+              <div class="route-row">
+                <span class="route-label" id="importWorkflowLabel">Workflow</span>
+                <strong class="route-value" id="importWorkflowValue">Imported Figure -> SAM -> SVG</strong>
+              </div>
+              <div class="route-row">
+                <span class="route-label" id="importStep1Label">Step 1</span>
+                <strong class="route-value" id="importStep1Value">Skipped</strong>
+              </div>
+              <div class="route-note" id="importRouteNote">
+                The default 4K aspect-ratio-preserving preprocessing still applies after import.
+              </div>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <div class="field-header">
+              <label class="field-label" id="importProviderLabel">API</label>
+              <div class="field-caption" id="importProviderCaption">
+                固定使用阿里云百炼 DashScope。请在项目根目录 <code>.env</code> 配置密钥与模型。
+              </div>
+            </div>
+            <div id="importProviderButtons" class="choice-grid" hidden>
+              <button type="button" class="choice-card" data-value="bianxie">
+                <span class="choice-title" id="importProviderBianxieTitle">Bianxie AI</span>
+                <span class="choice-meta" id="importProviderBianxieMeta">Mainland China-friendly OpenAI-compatible route</span>
+              </button>
+              <button type="button" class="choice-card" data-value="gemini">
+                <span class="choice-title" id="importProviderGeminiTitle">Gemini</span>
+                <span class="choice-meta" id="importProviderGeminiMeta">Google multimodal route</span>
+              </button>
+              <button type="button" class="choice-card" data-value="openai_response">
+                <span class="choice-title" id="importProviderOpenAIResponsesTitle">OpenAI Responses</span>
+                <span class="choice-meta" id="importProviderOpenAIResponsesMeta">Use the Responses API format</span>
+              </button>
+              <button type="button" class="choice-card" data-value="openrouter">
+                <span class="choice-title" id="importProviderOpenRouterTitle">OpenRouter</span>
+                <span class="choice-meta" id="importProviderOpenRouterMeta">OpenAI-compatible relay</span>
+              </button>
+              <button type="button" class="choice-card" data-value="custom">
+                <span class="choice-title" id="importProviderCustomTitle">Custom</span>
+                <span class="choice-meta" id="importProviderCustomMeta">Custom OpenAI-compatible endpoint</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" id="importSamBackendLabel" for="importSamBackend">SAM3 Backend</label>
+            <select id="importSamBackend" class="input">
+              <option value="fal" selected>fal.ai API (SAM3)</option>
+              <option value="roboflow">Roboflow API</option>
+              <option value="dashscope">DashScope VL (qwen3-vl-plus)</option>
+              <option value="local">Local (SAM3)</option>
+            </select>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" id="importSamPromptLabel" for="importSamPrompt">SAM Prompt</label>
+            <input
+              id="importSamPrompt"
+              type="text"
+              class="input"
+              value="icon,person,robot,animal"
+              placeholder="icon,person,robot,animal"
+            />
+          </div>
+
+          <div class="field-group" id="importSamApiKeyGroup" hidden>
+            <label class="field-label" id="importSamApiKeyLabel" for="importSamApiKey">SAM3 API Key</label>
+            <input
+              id="importSamApiKey"
+              type="password"
+              class="input"
+              placeholder="FAL/Roboflow API key"
+            />
+          </div>
+        </section>
+
+        <section class="actions">
+          <button id="importConfirmBtn" class="primary">Continue From Uploaded Figure</button>
+          <div id="importErrorMsg" class="error"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

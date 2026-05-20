@@ -1,0 +1,67 @@
+cff-version: 1.2.0
+message: "If AutoFigure-Edit materially helped your research or published figures, please cite the AutoFigure-Edit paper."
+title: "AutoFigure-Edit"
+type: software
+license: MIT
+repository-code: "https://github.com/ResearAI/AutoFigure-Edit"
+url: "https://github.com/ResearAI/AutoFigure-Edit"
+authors:
+  - family-names: Lin
+    given-names: Zhen
+  - family-names: Xie
+    given-names: Qiujie
+  - family-names: Zhu
+    given-names: Minjun
+  - family-names: Li
+    given-names: Shichen
+  - family-names: Sun
+    given-names: Qiyao
+  - family-names: Gu
+    given-names: Enhao
+  - family-names: Ding
+    given-names: Yiran
+  - family-names: Sun
+    given-names: Ke
+  - family-names: Guo
+    given-names: Fang
+  - family-names: Lu
+    given-names: Panzhong
+  - family-names: Ning
+    given-names: Zhiyuan
+  - family-names: Weng
+    given-names: Yixuan
+  - family-names: Zhang
+    given-names: Yue
+preferred-citation:
+  type: article
+  title: "AutoFigure-Edit: Generating Editable Scientific Illustration"
+  authors:
+    - family-names: Lin
+      given-names: Zhen
+    - family-names: Xie
+      given-names: Qiujie
+    - family-names: Zhu
+      given-names: Minjun
+    - family-names: Li
+      given-names: Shichen
+    - family-names: Sun
+      given-names: Qiyao
+    - family-names: Gu
+      given-names: Enhao
+    - family-names: Ding
+      given-names: Yiran
+    - family-names: Sun
+      given-names: Ke
+    - family-names: Guo
+      given-names: Fang
+    - family-names: Lu
+      given-names: Panzhong
+    - family-names: Ning
+      given-names: Zhiyuan
+    - family-names: Weng
+      given-names: Yixuan
+    - family-names: Zhang
+      given-names: Yue
+  year: 2026
+  journal: "arXiv"
+  url: "https://arxiv.org/abs/2603.06674"
