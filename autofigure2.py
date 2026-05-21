@@ -25,7 +25,7 @@ Box合并功能 (--merge_threshold):
 2. SAM3 分割图片，用灰色填充+黑色边框+序号标记 -> samed.png + boxlib.json
    2.1 支持多个text prompts分别检测
    2.2 合并重叠的boxes（可选，通过 --merge_threshold 控制）
-3. 裁切分割区域 + RMBG2 去背景 -> icons/icon_AF01_nobg.png, icon_AF02_nobg.png...
+3. 裁切分割区域 + 阿里云通用图像分割去背景 -> icons/icon_AF01_nobg.png, icon_AF02_nobg.png...
 4. 多模态调用 LLM 生成 SVG（占位符样式与 samed.png 一致）-> template.svg
 4.5. SVG 语法验证（lxml）+ LLM 修复
 4.6. LLM 优化 SVG 模板（位置和样式对齐）-> optimized_template.svg
@@ -81,8 +81,6 @@ import requests
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-from torchvision import transforms
-from transformers import AutoModelForImageSegmentation
 
 
 # ============================================================================
@@ -90,7 +88,7 @@ from transformers import AutoModelForImageSegmentation
 # ============================================================================
 
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEFAULT_IMAGE_MODEL = "wanx2.6-t2i"
+DEFAULT_IMAGE_MODEL = "wan2.6-t2i"
 DEFAULT_SVG_MODEL = "qwen3.6-plus"
 
 PlaceholderMode = Literal["none", "box", "label"]
@@ -1578,121 +1576,149 @@ def segment_with_sam3(
 
 
 # ============================================================================
-# 步骤三：裁切 + RMBG2 去背景
+# 步骤三：裁切 + 阿里云通用图像分割去背景
 # ============================================================================
 
-def _get_hf_token() -> Optional[str]:
-    token = (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-        or os.environ.get("HUGGINGFACE_TOKEN")
-    )
-    if not isinstance(token, str):
-        return None
-    token = token.strip()
-    return token or None
+ALIYUN_IMAGESEG_ENDPOINT = "imageseg.cn-shanghai.aliyuncs.com"
 
 
-def _has_rmbg2_cached_weights() -> bool:
-    hf_home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
-    snapshots_dir = hf_home / "hub" / "models--briaai--RMBG-2.0" / "snapshots"
-    if not snapshots_dir.exists():
-        return False
-    return any(snapshots_dir.glob("*/config.json"))
+def _get_required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"缺少环境变量 {name}，请在 .env 中配置后重试")
+    return value.strip()
 
 
-def _ensure_rmbg2_access_ready(rmbg_model_path: Optional[str]) -> None:
-    if rmbg_model_path and Path(rmbg_model_path).exists():
-        return
-    if _get_hf_token() is not None:
-        return
-    if _has_rmbg2_cached_weights():
-        return
-    raise RuntimeError(
-        "步骤三需要使用 briaai/RMBG-2.0，但当前未检测到可用访问凭据。\n"
-        "请先完成：\n"
-        "1) 申请访问 https://huggingface.co/briaai/RMBG-2.0\n"
-        "2) 在 .env 设置 HF_TOKEN=你的Read权限token\n"
-        "3) 重新运行 docker compose up -d --build"
-    )
+def _get_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if not isinstance(value, str) or not value.strip():
+        return default
+    try:
+        return int(value.strip())
+    except ValueError as e:
+        raise RuntimeError(f"环境变量 {name} 必须是整数，当前值为: {value}") from e
 
 
-class BriaRMBG2Remover:
-    """使用 BRIA-RMBG 2.0 模型进行高质量背景抠图"""
+def _ensure_aliyun_imageseg_access_ready() -> None:
+    _get_required_env("ALIBABA_CLOUD_ACCESS_KEY_ID")
+    _get_required_env("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
 
-    def __init__(self, model_path: Path | str | None = None, output_dir: Path | str | None = None):
-        self.model_path = Path(model_path) if model_path else None
+
+def _snake_to_pascal(value: str) -> str:
+    return "".join(part[:1].upper() + part[1:] for part in value.split("_") if part)
+
+
+def _read_tea_model_value(obj: Any, *keys: str) -> Any:
+    current = obj
+    for key in keys:
+        if current is None:
+            return None
+        if hasattr(current, "to_map"):
+            current = current.to_map()
+        if isinstance(current, dict):
+            current = (
+                current.get(key)
+                or current.get(key[:1].upper() + key[1:])
+                or current.get(_snake_to_pascal(key))
+            )
+        else:
+            current = getattr(current, key, None) or getattr(current, key[:1].upper() + key[1:], None)
+    if hasattr(current, "to_map"):
+        current = current.to_map()
+    return current
+
+
+class AliyunImageSegRemover:
+    """使用阿里云视觉智能开放平台通用分割接口进行背景抠图。"""
+
+    def __init__(self, output_dir: Path | str | None = None):
+        _ensure_aliyun_imageseg_access_ready()
         self.output_dir = Path(output_dir) if output_dir else Path("./output/icons")
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.model_repo_id = "briaai/RMBG-2.0"
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = device
-        hf_token = _get_hf_token()
+        try:
+            from alibabacloud_imageseg20191230.client import Client as ImageSegClient
+            from alibabacloud_tea_openapi import models as open_api_models
+        except ImportError as e:
+            raise RuntimeError(
+                "缺少阿里云图像分割 SDK，请先安装依赖：pip install -r requirements.txt"
+            ) from e
 
-        if self.model_path and self.model_path.exists():
-            print(f"加载本地 RMBG 权重: {self.model_path}")
-            self.model = AutoModelForImageSegmentation.from_pretrained(
-                str(self.model_path), trust_remote_code=True,
-            ).eval().to(device)
-        else:
-            print("从 HuggingFace 加载 RMBG-2.0 模型...")
-            if hf_token:
-                print("检测到 HF_TOKEN，使用鉴权访问 gated 模型。")
-            else:
-                print("未检测到 HF_TOKEN，尝试匿名访问（gated 模型通常会失败）。")
-
-            try:
-                self.model = AutoModelForImageSegmentation.from_pretrained(
-                    self.model_repo_id,
-                    trust_remote_code=True,
-                    token=hf_token,
-                ).eval().to(device)
-            except Exception as e:
-                msg = str(e).lower()
-                is_gated = (
-                    "gated repo" in msg
-                    or "cannot access gated repo" in msg
-                    or "access to model briaai/rmbg-2.0 is restricted" in msg
-                    or "401 client error" in msg
-                    or "you are trying to access a gated repo" in msg
-                )
-                if is_gated:
-                    raise RuntimeError(
-                        "无法下载 RMBG-2.0（HuggingFace gated 模型鉴权失败）。\n"
-                        "请按以下步骤配置：\n"
-                        "1) 登录并申请模型访问权限: https://huggingface.co/briaai/RMBG-2.0\n"
-                        "2) 创建具有 Read 权限的 token\n"
-                        "3) 在项目 .env 设置 HF_TOKEN=你的token\n"
-                        "4) 重新执行: docker compose up -d --build"
-                    ) from e
-                raise
-
-        self.image_size = (1024, 1024)
-        self.transform_image = transforms.Compose([
-            transforms.Resize(self.image_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
+        config = open_api_models.Config(
+            access_key_id=_get_required_env("ALIBABA_CLOUD_ACCESS_KEY_ID"),
+            access_key_secret=_get_required_env("ALIBABA_CLOUD_ACCESS_KEY_SECRET"),
+        )
+        config.endpoint = ALIYUN_IMAGESEG_ENDPOINT
+        self.client = ImageSegClient(config)
 
     def remove_background(self, image: Image.Image, output_name: str) -> str:
-        image_rgb = image.convert("RGB")
-        input_tensor = self.transform_image(image_rgb).unsqueeze(0).to(self.device)
+        try:
+            from alibabacloud_imageseg20191230 import models as imageseg_models
+            from alibabacloud_tea_util import models as util_models
+        except ImportError as e:
+            raise RuntimeError(
+                "缺少阿里云图像分割 SDK，请先安装依赖：pip install -r requirements.txt"
+            ) from e
 
-        with torch.no_grad():
-            preds = self.model(input_tensor)[-1].sigmoid().cpu()
+        image_stream = io.BytesIO()
+        image.convert("RGB").save(image_stream, format="PNG")
+        image_stream.seek(0)
 
-        pred = preds[0].squeeze()
-        pred_pil = transforms.ToPILImage()(pred)
-        mask = pred_pil.resize(image_rgb.size)
-
-        out = image_rgb.copy()
-        out.putalpha(mask)
+        request = imageseg_models.SegmentCommonImageAdvanceRequest(
+            image_urlobject=image_stream,
+            return_form="crop",
+        )
+        runtime = util_models.RuntimeOptions(
+            autoretry=True,
+            max_attempts=_get_int_env("ALIYUN_IMAGESEG_MAX_ATTEMPTS", 5),
+            connect_timeout=_get_int_env("ALIYUN_IMAGESEG_CONNECT_TIMEOUT_MS", 30000),
+            read_timeout=_get_int_env("ALIYUN_IMAGESEG_READ_TIMEOUT_MS", 120000),
+        )
+        response = self.client.segment_common_image_advance(request, runtime)
+        image_url = self._extract_result_image_url(response)
+        if not image_url:
+            raise RuntimeError(f"阿里云通用分割未返回 ImageURL，原始响应: {response}")
 
         out_path = self.output_dir / f"{output_name}_nobg.png"
-        out.save(out_path)
+        self._download_result(image_url, out_path)
         return str(out_path)
+
+    @staticmethod
+    def _extract_result_image_url(response: Any) -> Optional[str]:
+        body = getattr(response, "body", response)
+        image_url = _read_tea_model_value(body, "data", "image_url")
+        if isinstance(image_url, str) and image_url.strip():
+            return image_url.strip()
+        image_url = _read_tea_model_value(body, "Data", "ImageURL")
+        if isinstance(image_url, str) and image_url.strip():
+            return image_url.strip()
+        return None
+
+    @staticmethod
+    def _download_result(image_url: str, out_path: Path) -> None:
+        urls = [image_url]
+        if image_url.startswith("http://"):
+            urls.insert(0, "https://" + image_url[len("http://"):])
+
+        last_error: Exception | None = None
+        for attempt in range(1, 6):
+            for url in urls:
+                try:
+                    response = requests.get(url, timeout=120)
+                    if response.status_code in {502, 503, 504}:
+                        raise requests.HTTPError(
+                            f"{response.status_code} Server Error for url: {url}",
+                            response=response,
+                        )
+                    response.raise_for_status()
+                    out_path.write_bytes(response.content)
+                    return
+                except requests.RequestException as e:
+                    last_error = e
+            if attempt < 5:
+                time.sleep(min(2 * attempt, 8))
+
+        raise RuntimeError(f"下载阿里云分割结果失败: {image_url}") from last_error
 
 
 def crop_and_remove_background(
@@ -1702,12 +1728,12 @@ def crop_and_remove_background(
     rmbg_model_path: Optional[str] = None,
 ) -> list[dict]:
     """
-    根据 boxlib.json 裁切图片并使用 RMBG2 去背景
+    根据 boxlib.json 裁切图片并使用阿里云通用图像分割去背景
 
     文件命名使用 label: icon_AF01.png, icon_AF01_nobg.png
     """
     print("\n" + "=" * 60)
-    print("步骤三：裁切 + RMBG2 去背景")
+    print("步骤三：裁切 + 阿里云通用图像分割去背景")
     print("=" * 60)
 
     output_dir = Path(output_dir)
@@ -1724,7 +1750,9 @@ def crop_and_remove_background(
         print("警告: 没有检测到有效的 box")
         return []
 
-    remover = BriaRMBG2Remover(model_path=rmbg_model_path, output_dir=icons_dir)
+    if rmbg_model_path:
+        print("提示: --rmbg_model_path 已废弃，当前步骤三使用阿里云 API SDK")
+    remover = AliyunImageSegRemover(output_dir=icons_dir)
 
     icon_infos = []
     for box_info in boxes:
@@ -1754,8 +1782,6 @@ def crop_and_remove_background(
         print(f"  {label}: 裁切并去背景完成 -> {nobg_path}")
 
     del remover
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     return icon_infos
 
@@ -2736,7 +2762,7 @@ def method_to_svg(
     if no_icon_mode:
         print("步骤三跳过：当前为无图标回退模式")
     else:
-        _ensure_rmbg2_access_ready(rmbg_model_path)
+        _ensure_aliyun_imageseg_access_ready()
         icon_infos = crop_and_remove_background(
             image_path=str(figure_path),
             boxlib_path=boxlib_path,
@@ -2954,8 +2980,8 @@ if __name__ == "__main__":
     # SAM 参数（后端/提示/模型见 .env：AUTOFIGURE_SAM_*）
     parser.add_argument("--min_score", type=float, default=0.0, help="SAM 最低置信度阈值（默认: 0.0）")
 
-    # RMBG 参数
-    parser.add_argument("--rmbg_model_path", default=None, help="RMBG 模型本地路径（可选）")
+    # 去背景参数
+    parser.add_argument("--rmbg_model_path", default=None, help="已废弃：步骤三现在使用阿里云通用图像分割 API")
 
     # 流程控制参数
     parser.add_argument(

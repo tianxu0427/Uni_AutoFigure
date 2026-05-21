@@ -10,7 +10,7 @@
 
 1. **学术风格配图生成**：根据 Method 文本调用通义万相文生图，输出 `figure.png`
 2. **图标区域检测**：检测图中图标/对象区域，生成 `boxlib.json` 与标记图 `samed.png`
-3. **裁切与去背景**：按框裁切并用 RMBG-2.0 生成透明图标
+3. **裁切与去背景**：按框裁切并用阿里云通用图像分割生成透明图标
 4. **SVG 重建**：多模态模型根据原图与标记图生成 `template.svg`
 5. **图标嵌入**：将透明图标替换进 SVG，得到 `final.svg`
 
@@ -44,7 +44,8 @@
 | `AUTOFIGURE_SAM_MAX_MASKS` | 否 | fal 后端最大 mask 数（1–32），默认 `32` |
 | `AUTOFIGURE_FAL_KEY` | fal 时 | fal.ai SAM3 |
 | `AUTOFIGURE_ROBOFLOW_API_KEY` | roboflow 时 | Roboflow SAM3 |
-| `HF_TOKEN` | 步骤三 | RMBG-2.0 HuggingFace 访问 |
+| `ALIBABA_CLOUD_ACCESS_KEY_ID` | 步骤三 | 阿里云 AccessKey ID |
+| `ALIBABA_CLOUD_ACCESS_KEY_SECRET` | 步骤三 | 阿里云 AccessKey Secret |
 | `ROBOFLOW_API_URL` | 否 | Roboflow 接口地址 |
 | `ROBOFLOW_API_FALLBACK_URLS` | 否 | Roboflow 备用 URL，逗号分隔 |
 
@@ -57,7 +58,8 @@ AUTOFIGURE_SVG_MODEL=qwen3.6-plus
 AUTOFIGURE_MULTIMODAL_MODEL=qwen3-vl-plus
 AUTOFIGURE_SAM_BACKEND=dashscope
 AUTOFIGURE_SAM_PROMPT=icon,robot,animal,person
-HF_TOKEN=hf_xxx
+ALIBABA_CLOUD_ACCESS_KEY_ID=your_access_key_id
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=your_access_key_secret
 ```
 
 ---
@@ -78,7 +80,7 @@ HF_TOKEN=hf_xxx
 └─────────────────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────────────────────────┐
-│ 步骤三：按 box 裁切 + RMBG-2.0 去背景 → icons/*_nobg.png │
+│ 步骤三：按 box 裁切 + 阿里云通用图像分割去背景 → icons/*_nobg.png │
 └─────────────────────────────────────────────────────────┘
     ↓
 ┌─────────────────────────────────────────────────────────┐
@@ -142,9 +144,9 @@ HF_TOKEN=hf_xxx
 ### 4.5 步骤三：`crop_and_remove_background()`
 
 - 按 `boxlib.json` 裁切 → `icons/icon_AF01.png`
-- `BriaRMBG2Remover` 去背景 → `icons/icon_AF01_nobg.png`
-- 需 `HF_TOKEN` 且已申请 [briaai/RMBG-2.0](https://huggingface.co/briaai/RMBG-2.0)
-- 可选 `--rmbg_model_path` 指定本地权重目录
+- `AliyunImageSegRemover` 调用阿里云通用图像分割 → `icons/icon_AF01_nobg.png`
+- 需在 `.env` 配置 `ALIBABA_CLOUD_ACCESS_KEY_ID` 和 `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
+- `--rmbg_model_path` 已废弃，保留仅用于兼容旧命令
 
 ### 4.6 步骤四：`generate_svg_template()` + `check_and_fix_svg()`
 
@@ -194,7 +196,7 @@ HF_TOKEN=hf_xxx
 | 组件 | 方案 |
 |------|------|
 | **SAM3** | `AUTOFIGURE_SAM_BACKEND=local`，提前下载 HuggingFace 权重到缓存 |
-| **RMBG-2.0** | 提前下载权重，`--rmbg_model_path ./rmbg2_weights` |
+| **阿里云通用图像分割** | 需要可访问阿里云 API，并配置 AccessKey 环境变量 |
 | **Python 依赖** | `pip download` 打包 wheel |
 
 内网若无法访问百炼，需自建兼容接口（当前版本**未内置** custom provider，需改代码或保持外网 DashScope）。
@@ -207,11 +209,12 @@ HF_TOKEN=hf_xxx
 AUTOFIGURE_SAM_BACKEND=local
 ```
 
-### 6.4 RMBG-2.0 本地权重（简要）
+### 6.4 阿里云通用图像分割配置（简要）
 
 ```bash
-# 申请 HF 访问后 snapshot_download briaai/RMBG-2.0
-python autofigure2.py --method_file paper.txt --rmbg_model_path ./rmbg2_weights
+# .env 中配置阿里云 RAM 用户 AccessKey
+ALIBABA_CLOUD_ACCESS_KEY_ID=your_access_key_id
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=your_access_key_secret
 ```
 
 ---
@@ -244,7 +247,7 @@ python autofigure2.py --method_file paper.txt --rmbg_model_path ./rmbg2_weights
 |------|------|------|
 | `--min_score` | 检测框最低置信度（dashscope 无 score 时多为 1.0） | `0.0` |
 | `--merge_threshold` | 框合并重叠阈值，`0` 表示不合并 | `0.001` |
-| `--rmbg_model_path` | RMBG 本地权重目录 | 自动下载缓存 |
+| `--rmbg_model_path` | 已废弃，保留用于兼容旧命令 | 无 |
 
 SAM 相关 **不在 CLI**：`AUTOFIGURE_SAM_BACKEND`、`AUTOFIGURE_SAM_PROMPT`、`AUTOFIGURE_SAM_MAX_MASKS` 见 `.env`。
 
@@ -328,7 +331,7 @@ output/
 
 1. **配置方式**：修改 `.env` 后重新运行；不要将 API Key 提交到 Git。
 2. **物体定位**：国内推荐 `AUTOFIGURE_SAM_BACKEND=dashscope` + `AUTOFIGURE_MULTIMODAL_MODEL=qwen3-vl-plus`，无需安装 SAM3。
-3. **RMBG-2.0**：须在 HuggingFace 申请 `briaai/RMBG-2.0` 并设置 `HF_TOKEN`。
+3. **阿里云通用图像分割**：须开通视觉智能开放平台能力，并设置 `ALIBABA_CLOUD_ACCESS_KEY_ID` / `ALIBABA_CLOUD_ACCESS_KEY_SECRET`。
 4. **步骤二默认后端**：未设置 `AUTOFIGURE_SAM_BACKEND` 时代码默认为 `fal`，使用 DashScope 全流程时请在 `.env` 中显式写 `dashscope`。
 5. **合并阈值**：`--merge_threshold` 默认 `0.001`（几乎不合并）；若需积极去重可改为 `0.9`。
 6. **相关文档**：

@@ -124,7 +124,7 @@ The AutoFigure-edit pipeline transforms a raw generation into an editable SVG in
 
 AutoFigure2’s pipeline starts from the paper’s method text and first calls a **text‑to‑image LLM** to render a journal‑style schematic, saved as `figure.png`. The system then runs **SAM3 segmentation** on that image using one or more text prompts (e.g., “icon, diagram, arrow”), merges overlapping detections by an IoU‑like threshold, and draws gray‑filled, black‑outlined labeled boxes on the original; this produces both `samed.png` (the labeled mask overlay) and a structured `boxlib.json` with coordinates, scores, and prompt sources.
 
-Next, each box is cropped from the original figure and passed through **RMBG‑2.0** for background removal, yielding transparent icon assets under `icons/*.png` and `*_nobg.png`. With `figure.png`, `samed.png`, and `boxlib.json` as multimodal inputs, the LLM generates a **placeholder‑style SVG** (`template.svg`) whose boxes match the labeled regions.
+Next, each box is cropped from the original figure and passed through **Alibaba Cloud general image segmentation** for background removal, yielding transparent icon assets under `icons/*.png` and `*_nobg.png`. With `figure.png`, `samed.png`, and `boxlib.json` as multimodal inputs, the LLM generates a **placeholder‑style SVG** (`template.svg`) whose boxes match the labeled regions.
 
 Optionally, the SVG is iteratively refined by an **LLM optimizer** to better align strokes, layouts, and styles, resulting in `optimized_template.svg` (or the original template if optimization is skipped). The system then compares the SVG dimensions with the original figure to compute scale factors and aligns coordinate systems. Finally, it replaces each placeholder in the SVG with the corresponding transparent icon (matched by label/ID), producing the assembled `final.svg`.
 
@@ -145,7 +145,7 @@ Use Docker for a reproducible one-command setup without local Python/SAM3 instal
 
 - Docker Desktop (with Docker Compose v2)
 - Port `8000` available on host
-- HuggingFace access to `briaai/RMBG-2.0`: https://huggingface.co/briaai/RMBG-2.0
+- Alibaba Cloud Visual Intelligence ImageSeg access with `ALIBABA_CLOUD_ACCESS_KEY_ID` and `ALIBABA_CLOUD_ACCESS_KEY_SECRET`
 
 #### 1) Prepare `.env`
 
@@ -160,7 +160,8 @@ Copy-Item .env.example .env
 At minimum, set this in `.env`:
 
 ```bash
-HF_TOKEN=hf_xxx
+ALIBABA_CLOUD_ACCESS_KEY_ID=your_access_key_id
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=your_access_key_secret
 ```
 
 Optional but recommended:
