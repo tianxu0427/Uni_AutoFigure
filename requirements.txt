@@ -9,7 +9,6 @@ python-multipart>=0.0.9,<1.0
 
 # API clients / HTTP
 requests>=2.31,<3.0
-fal-client>=0.5,<1.0
 openai>=1.0,<2.0
 google-genai>=1.0,<2.0
 alibabacloud_imageseg20191230>=2.0

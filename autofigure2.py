@@ -68,7 +68,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, cast
 
 # 加载 .env 环境变量
 from dotenv import load_dotenv
@@ -84,82 +84,39 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 # ============================================================================
-# DashScope 配置
+# 运行时默认配置（可被 .env 或 CLI 覆盖，见各步骤函数内的 os.environ.get）
 # ============================================================================
 
+# --- 百炼 DashScope API 端点 ---
+# OpenAI 兼容 Chat：步骤四/五 SVG 文本生成与多模态对话
 DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DEFAULT_IMAGE_MODEL = "wan2.6-t2i"
-DEFAULT_SVG_MODEL = "qwen3.6-plus"
-
-PlaceholderMode = Literal["none", "box", "label"]
-DEFAULT_UPSCALE_IMAGE_SIZE = "4K"
-IMAGE_SIZE_CHOICES = ("1K", "2K", "4K")
-UPSCALE_TARGET_LONG_EDGE = 3840
-BOXLIB_NO_ICON_MODE_KEY = "no_icon_mode"
-
-# SAM3 API config (fal.ai: https://fal.ai/models/fal-ai/sam-3/image)
-SAM3_FAL_MODEL_ID = "fal-ai/sam-3/image"
-SAM3_FAL_SYNC_URL = f"https://fal.run/{SAM3_FAL_MODEL_ID}"
-SAM3_FAL_QUEUE_URL = f"https://queue.fal.run/{SAM3_FAL_MODEL_ID}"
-SAM3_FAL_QUEUE_POLL_INTERVAL = 1.0
-SAM3_ROBOFLOW_API_URL = os.environ.get(
-    "ROBOFLOW_API_URL",
-    "https://serverless.roboflow.com/sam3/concept_segment",
+# 通义万相生图专用 REST 端点（步骤一 figure.png）
+DASHSCOPE_IMAGE_GENERATION_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 )
-SAM3_API_TIMEOUT = 300
-DEFAULT_MULTIMODAL_VL_MODEL = "qwen3-vl-plus"
-SAM_DASHSCOPE_VL_MAX_TOKENS = 4096
-SamBackendType = Literal["local", "fal", "roboflow", "api", "dashscope"]
 
-# 仅从 .env 读取（每项对应唯一环境变量名）
-ENV_API_KEY = "AUTOFIGURE_API_KEY"
-ENV_IMAGE_MODEL = "AUTOFIGURE_IMAGE_MODEL"
-ENV_SVG_MODEL = "AUTOFIGURE_SVG_MODEL"
-ENV_MULTIMODAL_MODEL = "AUTOFIGURE_MULTIMODAL_MODEL"
-ENV_SAM_BACKEND = "AUTOFIGURE_SAM_BACKEND"
-ENV_SAM_PROMPT = "AUTOFIGURE_SAM_PROMPT"
-ENV_SAM_MAX_MASKS = "AUTOFIGURE_SAM_MAX_MASKS"
-ENV_FAL_KEY = "AUTOFIGURE_FAL_KEY"
-ENV_ROBOFLOW_API_KEY = "AUTOFIGURE_ROBOFLOW_API_KEY"
+# --- 模型默认值（.env：AUTOFIGURE_IMAGE_MODEL / SVG_MODEL / MULTIMODAL_MODEL）---
+DEFAULT_IMAGE_MODEL = "wan2.6-t2i"  # 步骤一：paper method → 学术示意图
+DEFAULT_SVG_MODEL = "qwen3.6-plus"  # 步骤四/五：生成与优化 SVG 模板
 
+# --- 占位符与步骤一后处理 ---
+PlaceholderMode = Literal["none", "box", "label"]  # CLI --placeholder_mode
+DEFAULT_UPSCALE_IMAGE_SIZE = "4K"  # CLI --image_size；传给万相的 size 参数
+IMAGE_SIZE_CHOICES = ("1K", "2K", "4K")  # argparse choices
+UPSCALE_TARGET_LONG_EDGE = 3840  # 步骤一后等比例放大时长边像素（约 4K）
+BOXLIB_NO_ICON_MODE_KEY = "no_icon_mode"  # boxlib.json 中标记「未检测到图标」
 
-def _required_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise ValueError(f"缺少环境变量 {name}，请在项目根目录 .env 中配置")
-    return value
+# --- 步骤二 SAM / 物体检测（后端由 AUTOFIGURE_SAM_BACKEND 选择）---
+DEFAULT_ROBOFLOW_API_URL = "https://serverless.roboflow.com/sam3/concept_segment"
+SAM3_API_TIMEOUT = 300  # Roboflow / 模力方舟 HTTP 请求超时（秒）
+GITEE_SAM3_MODEL = "sam3"  # 模力方舟请求体 model 字段
+GITEE_SAM3_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 平台硬上限 5MB
+GITEE_SAM3_UPLOAD_TARGET_BYTES = int(4.8 * 1024 * 1024)  # 压缩目标，留余量
+DEFAULT_MULTIMODAL_VL_MODEL = "qwen3-vl-plus"  # dashscope 后端：Qwen-VL 物体定位
+SAM_DASHSCOPE_VL_MAX_TOKENS = 4096  # dashscope 后端 grounding 回复最大 token
+SamBackendType = Literal["local", "roboflow", "dashscope", "gitee"]
 
-
-def _optional_env(name: str, default: str = "") -> str:
-    return os.environ.get(name, "").strip() or default
-
-
-def load_app_config() -> dict[str, Any]:
-    """从 .env 加载 DashScope 运行配置。"""
-    api_key = _required_env(ENV_API_KEY)
-
-    sam_backend = _optional_env(ENV_SAM_BACKEND, "fal")
-    if sam_backend == "api":
-        sam_backend = "fal"
-
-    try:
-        sam_max_masks = max(1, min(32, int(_optional_env(ENV_SAM_MAX_MASKS, "32"))))
-    except ValueError:
-        sam_max_masks = 32
-
-    return {
-        "api_key": api_key,
-        "base_url": DASHSCOPE_BASE_URL,
-        "image_gen_model": _optional_env(ENV_IMAGE_MODEL, DEFAULT_IMAGE_MODEL),
-        "svg_gen_model": _optional_env(ENV_SVG_MODEL, DEFAULT_SVG_MODEL),
-        "multimodal_model": _optional_env(ENV_MULTIMODAL_MODEL, DEFAULT_MULTIMODAL_VL_MODEL),
-        "sam_backend": sam_backend,
-        "sam_prompts": _optional_env(ENV_SAM_PROMPT, "icon,robot,animal,person"),
-        "sam_max_masks": sam_max_masks,
-    }
-
-
-# Step 1 reference image settings (overridden by CLI)
+# --- 步骤一参考图（CLI --use_reference_image / --reference_image_path 会覆盖）---
 USE_REFERENCE_IMAGE = False
 REFERENCE_IMAGE_PATH: Optional[str] = None
 
@@ -176,7 +133,20 @@ def call_llm_text(
     max_tokens: int = 16000,
     temperature: float = 0.7,
 ) -> Optional[str]:
-    """DashScope 兼容模式文本对话。"""
+    """
+    DashScope 兼容模式文本对话（OpenAI SDK 封装）。
+
+    Args:
+        prompt (str): 用户提示词。
+        api_key (str): 百炼 API Key。
+        model (str): 对话模型名称。
+        base_url (str): OpenAI 兼容端点，默认 DASHSCOPE_BASE_URL。
+        max_tokens (int): 最大生成 token 数。
+        temperature (float): 采样温度。
+
+    Returns:
+        content (Optional[str]): 模型回复文本；无有效 choices 时为 None。
+    """
     return _call_dashscope_chat_text(prompt, api_key, model, base_url, max_tokens, temperature)
 
 
@@ -188,7 +158,20 @@ def call_llm_multimodal(
     max_tokens: int = 16000,
     temperature: float = 0.7,
 ) -> Optional[str]:
-    """DashScope 兼容模式多模态对话。"""
+    """
+    DashScope 兼容模式多模态对话。
+
+    Args:
+        contents (List[Any]): 文本字符串与 PIL.Image 交替组成的内容列表。
+        api_key (str): 百炼 API Key。
+        model (str): 多模态模型名称。
+        base_url (str): OpenAI 兼容端点。
+        max_tokens (int): 最大生成 token 数。
+        temperature (float): 采样温度。
+
+    Returns:
+        content (Optional[str]): 模型回复文本。
+    """
     return _call_dashscope_chat_multimodal(
         contents, api_key, model, base_url, max_tokens, temperature
     )
@@ -198,10 +181,32 @@ def call_llm_image_generation(
     prompt: str,
     api_key: str,
     model: str,
+    base_url: str = DASHSCOPE_IMAGE_GENERATION_URL,
     reference_image: Optional[Image.Image] = None,
+    image_size: str = DEFAULT_UPSCALE_IMAGE_SIZE,
 ) -> Optional[Image.Image]:
-    """通义万相文生图。"""
-    return _call_dashscope_image_generation(prompt, api_key, model, reference_image)
+    """
+    通义万相文生图（wan 系列等多模态生图接口）。
+
+    Args:
+        prompt (str): 生图提示词。
+        api_key (str): 百炼 API Key。
+        model (str): 生图模型名称。
+        base_url (str): 万相生图 REST 端点。
+        reference_image (Optional[Image.Image]): 可选参考图（风格迁移）。
+        image_size (str): 分辨率档位 1K/2K/4K。
+
+    Returns:
+        image (Optional[Image.Image]): 下载后的 PIL 图片。
+    """
+    return _call_dashscope_image_generation(
+        prompt=prompt,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        reference_image=reference_image,
+        image_size=image_size,
+    )
 
 
 # ============================================================================
@@ -216,7 +221,23 @@ def _call_dashscope_chat_text(
     max_tokens: int = 16000,
     temperature: float = 0.7,
 ) -> Optional[str]:
-    """DashScope 兼容模式文本接口（OpenAI SDK）。"""
+    """
+    调用 DashScope OpenAI 兼容 Chat 文本接口。
+
+    Args:
+        prompt (str): 用户提示词。
+        api_key (str): 百炼 API Key。
+        model (str): 模型名称。
+        base_url (str): API base URL。
+        max_tokens (int): 最大生成 token。
+        temperature (float): 采样温度。
+
+    Returns:
+        content (Optional[str]): 助手回复正文。
+
+    Raises:
+        Exception: API 调用失败时打印错误并重新抛出。
+    """
     try:
         from openai import OpenAI
 
@@ -243,7 +264,23 @@ def _call_dashscope_chat_multimodal(
     max_tokens: int = 16000,
     temperature: float = 0.7,
 ) -> Optional[str]:
-    """DashScope 兼容模式多模态接口（OpenAI SDK）。"""
+    """
+    调用 DashScope OpenAI 兼容 Chat 多模态接口。
+
+    Args:
+        contents (List[Any]): 文本与 PIL.Image 片段列表。
+        api_key (str): 百炼 API Key。
+        model (str): 多模态模型名称。
+        base_url (str): API base URL。
+        max_tokens (int): 最大生成 token。
+        temperature (float): 采样温度。
+
+    Returns:
+        content (Optional[str]): 助手回复正文。
+
+    Raises:
+        Exception: API 调用失败时打印错误并重新抛出。
+    """
     try:
         from openai import OpenAI
 
@@ -275,58 +312,220 @@ def _call_dashscope_chat_multimodal(
         raise
 
 
+def _pil_image_to_data_uri(image: Image.Image) -> str:
+    """
+    将 PIL 图片编码为 PNG data URI。
+
+    Args:
+        image (Image.Image): 输入图片。
+
+    Returns:
+        data_uri (str): ``data:image/png;base64,...`` 字符串。
+    """
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{image_b64}"
+
+
+def _resolve_dashscope_image_size(image_size: Optional[str]) -> str:
+    """
+    将 CLI/配置的 image_size 映射为万相 API 的 size 参数字符串。
+
+    Args:
+        image_size (Optional[str]): 1K、2K 或 4K；None 与其它值按 4K 处理。
+
+    Returns:
+        size (str): 形如 ``1440*1440`` 的万相尺寸字符串。
+    """
+    if image_size == "1K":
+        return "1280*1280"
+    if image_size == "2K":
+        return "1440*1440"
+    return "1440*1440"
+
+
+def _collect_dashscope_image_urls(value: Any) -> List[str]:
+    """
+    递归遍历 DashScope 生图 JSON，收集图片 URL。
+
+    Args:
+        value (Any): 响应中的 dict/list 子树。
+
+    Returns:
+        urls (List[str]): 去重前的 URL 列表（按遍历顺序）。
+    """
+    urls: List[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"image", "image_url", "url"} and isinstance(item, str) and item.strip():
+                urls.append(item.strip())
+            else:
+                urls.extend(_collect_dashscope_image_urls(item))
+    elif isinstance(value, list):
+        for item in value:
+            urls.extend(_collect_dashscope_image_urls(item))
+    return urls
+
+
+def _download_image_from_url(image_url: str) -> Image.Image:
+    """
+    从 URL 下载图片并加载为 PIL Image。
+
+    Args:
+        image_url (str): 图片直链。
+
+    Returns:
+        image (Image.Image): 已 load 的 PIL 图片对象。
+    """
+    resp = _requests_get_with_retries(image_url, timeout=120)
+    image = Image.open(io.BytesIO(resp.content))
+    image.load()
+    return image
+
+
+def _requests_post_json_with_retries(
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    timeout: int = 300,
+    attempts: int = 3,
+) -> requests.Response:
+    """
+    带指数退避的 POST JSON 请求（用于万相生图等）。
+
+    Args:
+        url (str): 请求 URL。
+        headers (Dict[str, str]): HTTP 头。
+        payload (Dict[str, Any]): JSON 请求体。
+        timeout (int): 单次超时秒数。
+        attempts (int): 最大尝试次数。
+
+    Returns:
+        response (requests.Response): 成功时的 HTTP 响应。
+
+    Raises:
+        requests.exceptions.RequestException: 全部重试失败后抛出最后一次异常。
+    """
+    last_error: Optional[Exception] = None
+    headers = {**headers, "Connection": "close"}
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            return response
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            wait_seconds = 2 * attempt
+            print(f"DashScope 请求失败 ({exc})，{wait_seconds}s 后重试...")
+            time.sleep(wait_seconds)
+    raise last_error if last_error else RuntimeError("DashScope 请求失败")
+
+
+def _requests_get_with_retries(
+    url: str,
+    timeout: int = 120,
+    attempts: int = 3,
+) -> requests.Response:
+    """
+    带指数退避的 GET 请求（用于下载生图结果等）。
+
+    Args:
+        url (str): 请求 URL。
+        timeout (int): 单次超时秒数。
+        attempts (int): 最大尝试次数。
+
+    Returns:
+        response (requests.Response): HTTP 200 的响应。
+
+    Raises:
+        requests.exceptions.RequestException: 全部重试失败后抛出。
+    """
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, headers={"Connection": "close"}, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            wait_seconds = 2 * attempt
+            print(f"图片下载失败 ({exc})，{wait_seconds}s 后重试...")
+            time.sleep(wait_seconds)
+    raise last_error if last_error else RuntimeError("图片下载失败")
+
+
 def _call_dashscope_image_generation(
     prompt: str,
     api_key: str,
     model: str,
+    base_url: str,
     reference_image: Optional[Image.Image] = None,
+    image_size: str = DEFAULT_UPSCALE_IMAGE_SIZE,
 ) -> Optional[Image.Image]:
-    """使用 DashScope SDK 调用通义万相图像生成"""
+    """
+    调用 DashScope 万相生图 REST API 并下载首张结果图。
+
+    Args:
+        prompt (str): 生图提示词（可含参考图 content）。
+        api_key (str): 百炼 API Key。
+        model (str): 万相模型 ID。
+        base_url (str): 生图 API 端点 URL。
+        reference_image (Optional[Image.Image]): 可选参考图。
+        image_size (str): 1K/2K/4K 档位。
+
+    Returns:
+        image (Optional[Image.Image]): 下载的 PIL 图片。
+
+    Raises:
+        Exception: HTTP 非 200、响应无 URL 或下载失败时抛出。
+    """
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    message_content: List[Dict[str, Any]] = [{"text": prompt}]
+
+    if reference_image is not None:
+        message_content.append({"image": _pil_image_to_data_uri(reference_image)})
+
+    payload = {
+        "model": model,
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": message_content,
+                }
+            ]
+        },
+        "parameters": {
+            "prompt_extend": True,
+            "watermark": False,
+            "n": 1,
+            "negative_prompt": "",
+            "size": _resolve_dashscope_image_size(image_size),
+        },
+    }
+
     try:
-        import dashscope
-        from dashscope import ImageSynthesis
+        response = _requests_post_json_with_retries(base_url, headers, payload, timeout=300)
+        if response.status_code != 200:
+            raise Exception(f"DashScope API error: {response.status_code} - {response.text[:1000]}")
 
-        dashscope.api_key = api_key
+        result = response.json()
+        if "error" in result:
+            raise Exception(f"DashScope API error: {result['error']}")
 
-        # 通义万相支持的模型: wanx-v1, wanx2.1-t2i-turbo, wanx2.1-t2i-plus
-        # 使用 ImageSynthesis API
-        if reference_image is None:
-            response = ImageSynthesis.call(
-                model=model,
-                prompt=prompt,
-                n=1,
-                size="1024*1024",
-            )
-        else:
-            # 参考图编辑模式 - 将参考图转为 base64
-            buf = io.BytesIO()
-            reference_image.save(buf, format='PNG')
-            image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        image_urls = _collect_dashscope_image_urls(result.get("output", result))
+        if not image_urls:
+            preview = json.dumps(result, ensure_ascii=False)[:1000]
+            raise Exception(f"DashScope 响应中未找到图片 URL: {preview}")
 
-            response = ImageSynthesis.call(
-                model=model,
-                prompt=prompt,
-                n=1,
-                size="1024*1024",
-                ref_image=image_b64,  # 参考图
-            )
-
-        if response.status_code == 200:
-            # 从响应中提取图片
-            if response.output and response.output.results:
-                result = response.output.results[0]
-                image_url = result.url
-                if image_url:
-                    resp = requests.get(image_url, timeout=120)
-                    resp.raise_for_status()
-                    image = Image.open(io.BytesIO(resp.content))
-                    image.load()
-                    return image
-            print("[DashScope] 响应中没有找到图片")
-            return None
-        else:
-            print(f"[DashScope] API 调用失败: {response.code} - {response.message}")
-            return None
+        return _download_image_from_url(image_urls[0])
     except Exception as e:
         print(f"[DashScope] 图像生成 API 调用失败: {e}")
         raise
@@ -337,7 +536,12 @@ def _call_dashscope_image_generation(
 # ============================================================================
 
 def _get_lanczos_resample() -> int:
-    """Get a Pillow LANCZOS resampling constant across versions."""
+    """
+    获取 Pillow LANCZOS 重采样常量（兼容新旧版本 API）。
+
+    Returns:
+        resample (int): Image.Resampling.LANCZOS 或 Image.LANCZOS。
+    """
     if hasattr(Image, "Resampling"):
         return Image.Resampling.LANCZOS
     return Image.LANCZOS
@@ -347,7 +551,17 @@ def _upscale_image_to_4k_if_needed(
     image: Image.Image,
     target_long_edge: int = UPSCALE_TARGET_LONG_EDGE,
 ) -> tuple[Image.Image, bool]:
-    """Upscale an image so its long edge reaches 4K while preserving aspect ratio."""
+    """
+    将图片长边放大至目标像素（默认约 4K），保持宽高比。
+
+    Args:
+        image (Image.Image): 输入图片。
+        target_long_edge (int): 目标长边像素，默认 UPSCALE_TARGET_LONG_EDGE。
+
+    Returns:
+        upscaled_image (Image.Image): 放大后或原图。
+        did_upscale (bool): 是否实际执行了放大。
+    """
     width, height = image.size
     long_edge = max(width, height)
     if long_edge <= 0 or long_edge >= target_long_edge:
@@ -361,7 +575,16 @@ def _upscale_image_to_4k_if_needed(
 
 
 def _save_image_as_png(image: Image.Image, output_path: Path) -> None:
-    """Persist a PIL image as PNG, normalizing SDK-specific image wrappers if needed."""
+    """
+    将 PIL 图片保存为 PNG，兼容部分 SDK 返回的特殊 Image 包装类型。
+
+    Args:
+        image (Image.Image): 待保存图片。
+        output_path (Path): 输出文件路径。
+
+    Returns:
+        None
+    """
     try:
         image.save(str(output_path), format="PNG")
     except TypeError:
@@ -375,7 +598,17 @@ def prepare_imported_figure(
     output_path: str,
     enable_upscale: bool = True,
 ) -> str:
-    """Normalize an imported stage-1 figure and copy it into the run output directory."""
+    """
+    步骤一：跳过生图，规范化导入图片并写入输出目录。
+
+    Args:
+        input_figure_path (str): 用户提供的 figure 图片路径。
+        output_path (str): 目标 figure.png 路径。
+        enable_upscale (bool): 是否执行 4K 长边等比例放大。
+
+    Returns:
+        output_path (str): 保存后的图片路径字符串。
+    """
     print("=" * 60)
     print("步骤一：跳过生图，使用已有的第一阶段图片")
     print("=" * 60)
@@ -408,29 +641,35 @@ def generate_figure_from_method(
     output_path: str,
     api_key: str,
     model: str,
+    base_url: str = DASHSCOPE_IMAGE_GENERATION_URL,
     use_reference_image: Optional[bool] = None,
     reference_image_path: Optional[str] = None,
+    image_size: str = DEFAULT_UPSCALE_IMAGE_SIZE,
     enable_upscale: bool = True,
 ) -> str:
     """
-    使用 LLM 生成学术风格图片
+    步骤一：根据 paper method 文本调用万相生成学术示意图。
 
     Args:
-        method_text: Paper method 文本内容
-        output_path: 输出图片路径
-        api_key: API Key
-        model: 生图模型名称
-        use_reference_image: 是否使用参考图片（None 则使用全局设置）
-        reference_image_path: 参考图片路径（None 则使用全局设置）
+        method_text (str): 论文方法章节文本。
+        output_path (str): 输出 figure.png 路径。
+        api_key (str): 百炼 API Key。
+        model (str): 生图模型名称。
+        base_url (str): 万相生图 API 端点。
+        use_reference_image (Optional[bool]): 是否使用参考图；None 时用全局 USE_REFERENCE_IMAGE。
+        reference_image_path (Optional[str]): 参考图路径；None 时用全局 REFERENCE_IMAGE_PATH。
+        image_size (str): 1K/2K/4K。
+        enable_upscale (bool): 生图后是否放大至 4K 长边。
 
     Returns:
-        生成的图片路径
+        output_path (str): 保存后的图片路径。
     """
     print("=" * 60)
     print("步骤一：使用 LLM 生成学术风格图片")
     print("=" * 60)
     print("Provider: dashscope")
     print(f"模型: {model}")
+    print(f"生图尺寸: {_resolve_dashscope_image_size(image_size)}")
     print(f"4K等比例放大: {'开启' if enable_upscale else '关闭'}")
 
     if use_reference_image is None:
@@ -478,13 +717,15 @@ Below is the method section of the paper:
 
 The figure should be engaging and using academic journal style with cute characters."""
 
-    print(f"发送请求到: {DASHSCOPE_BASE_URL}")
+    print(f"发送请求到: {base_url}")
 
     img = call_llm_image_generation(
         prompt=prompt,
         api_key=api_key,
         model=model,
+        base_url=base_url,
         reference_image=reference_image,
+        image_size=image_size,
     )
 
     if img is None:
@@ -520,11 +761,11 @@ def get_label_font(box_width: int, box_height: int) -> ImageFont.FreeTypeFont:
     根据 box 尺寸动态计算合适的字体大小
 
     Args:
-        box_width: 矩形宽度
-        box_height: 矩形高度
+        box_width (int): 占位矩形宽度（像素）。
+        box_height (int): 占位矩形高度（像素）。
 
     Returns:
-        PIL ImageFont 对象
+        font (ImageFont.FreeTypeFont): 适配尺寸的字体；失败时可能为 None。
     """
     # 字体大小为 box 短边的 1/4，最小 12，最大 48
     min_dim = min(box_width, box_height)
@@ -561,11 +802,11 @@ def calculate_overlap_ratio(box1: dict, box2: dict) -> float:
     计算两个box的重叠比例
 
     Args:
-        box1: 第一个box，包含 x1, y1, x2, y2
-        box2: 第二个box，包含 x1, y1, x2, y2
+        box1 (dict): 第一个框，含 x1/y1/x2/y2。
+        box2 (dict): 第二个框，含 x1/y1/x2/y2。
 
     Returns:
-        重叠比例 = 交集面积 / 较小box面积
+        ratio (float): 交集面积除以较小框面积，无交集时为 0.0。
     """
     # 计算交集区域
     x1 = max(box1["x1"], box2["x1"])
@@ -595,11 +836,11 @@ def merge_two_boxes(box1: dict, box2: dict) -> dict:
     合并两个box为最小包围矩形
 
     Args:
-        box1: 第一个box
-        box2: 第二个box
+        box1 (dict): 第一个框。
+        box2 (dict): 第二个框。
 
     Returns:
-        合并后的box（最小包围矩形）
+        merged (dict): 最小外接矩形，保留较高 score 与 prompt。
     """
     merged = {
         "x1": min(box1["x1"], box2["x1"]),
@@ -632,11 +873,11 @@ def merge_overlapping_boxes(boxes: list, overlap_threshold: float = 0.9) -> list
     迭代合并重叠的boxes
 
     Args:
-        boxes: box列表，每个box包含 x1, y1, x2, y2, score
-        overlap_threshold: 重叠阈值，超过此值则合并（默认0.9）
+        boxes (list): 检测框列表，每项含 x1/y1/x2/y2/score 等。
+        overlap_threshold (float): 重叠比例阈值，超过则合并；0 表示不合并。
 
     Returns:
-        合并后的box列表，重新编号
+        merged_boxes (list): 合并后重新编号的框列表（含 id、label）。
     """
     if overlap_threshold <= 0 or len(boxes) <= 1:
         return boxes
@@ -688,56 +929,339 @@ def merge_overlapping_boxes(boxes: list, overlap_threshold: float = 0.9) -> list
     return result
 
 
-def _get_fal_api_key() -> str:
-    return _required_env(ENV_FAL_KEY)
-
-
 def _get_roboflow_api_key() -> str:
-    return _required_env(ENV_ROBOFLOW_API_KEY)
+    """
+    从环境变量读取 Roboflow SAM3 API Key。
+
+    Returns:
+        api_key (str): AUTOFIGURE_ROBOFLOW_API_KEY 的值。
+
+    Raises:
+        ValueError: 未配置或为空时抛出。
+    """
+    value = os.environ.get("AUTOFIGURE_ROBOFLOW_API_KEY", "").strip()
+    if not value:
+        raise ValueError("缺少环境变量 AUTOFIGURE_ROBOFLOW_API_KEY，请在项目根目录 .env 中配置")
+    return value
 
 
-def _image_to_data_uri(image: Image.Image) -> str:
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{image_b64}"
+def _get_gitee_api_key() -> str:
+    """
+    从环境变量读取模力方舟 API Token。
+
+    Returns:
+        api_key (str): AUTOFIGURE_GITEE_API_KEY 的值。
+
+    Raises:
+        ValueError: 未配置或为空时抛出。
+    """
+    value = os.environ.get("AUTOFIGURE_GITEE_API_KEY", "").strip()
+    if not value:
+        raise ValueError("缺少环境变量 AUTOFIGURE_GITEE_API_KEY，请在项目根目录 .env 中配置")
+    return value
 
 
-def _image_to_base64(image: Image.Image) -> str:
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+def _gitee_sam3_api_mode() -> str:
+    """
+    解析模力方舟 SAM3 接口模式（分割 vs 目标检测）。
+
+    Returns:
+        mode (str): ``segmentation`` 或 ``object-detection``。
+
+    Raises:
+        ValueError: 环境变量缺失或取值不支持时抛出。
+    """
+    mode = os.environ.get("GITEE_SAM3_API_MODE", "").strip()
+    if not mode:
+        raise ValueError("缺少环境变量 GITEE_SAM3_API_MODE，请在项目根目录 .env 中配置")
+    mode = mode.lower()
+    if mode in ("segmentation", "segment", "cut"):
+        return "segmentation"
+    if mode in ("object-detection", "object_detection", "detection", "detect"):
+        return "object-detection"
+    raise ValueError(
+        f"不支持的 GITEE_SAM3_API_MODE={mode!r}，可选: segmentation, object-detection"
+    )
 
 
-def _cxcywh_norm_to_xyxy(box: list | tuple, width: int, height: int) -> Optional[tuple[int, int, int, int]]:
+def _image_to_rgb_for_jpeg(image: Image.Image) -> Image.Image:
+    """
+    将 PIL 图转为可 JPEG 编码的 RGB（RGBA 铺白底）。
+
+    Args:
+        image (Image.Image): 任意模式的 PIL 图。
+
+    Returns:
+        rgb_image (Image.Image): RGB 模式图片。
+    """
+    if image.mode == "RGB":
+        return image
+    if image.mode == "RGBA":
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(image, mask=image.split()[3])
+        return background
+    return image.convert("RGB")
+
+
+def _prepare_gitee_sam3_upload(
+    image: Image.Image,
+    max_bytes: int = GITEE_SAM3_UPLOAD_TARGET_BYTES,
+) -> tuple[bytes, str, tuple[int, int], float, float]:
+    """
+    压缩/缩放图片以满足模力方舟 5MB 上传限制。
+
+    Args:
+        image (Image.Image): 原图。
+        max_bytes (int): 目标最大字节数，默认 GITEE_SAM3_UPLOAD_TARGET_BYTES。
+
+    Returns:
+        image_bytes (bytes): JPEG 编码后的上传数据。
+        mime_type (str): ``image/jpeg``。
+        upload_size (tuple[int, int]): 上传图宽高 (w, h)。
+        scale_x (float): 原图宽 / 上传图宽，用于 bbox 回映射。
+        scale_y (float): 原图高 / 上传图高。
+
+    Raises:
+        RuntimeError: 无法压缩到限制大小时抛出。
+    """
+    orig_w, orig_h = image.size
+    rgb = _image_to_rgb_for_jpeg(image)
+    dimension_scale = 1.0
+
+    while dimension_scale >= 0.08:
+        if dimension_scale < 1.0:
+            upload_w = max(1, int(round(orig_w * dimension_scale)))
+            upload_h = max(1, int(round(orig_h * dimension_scale)))
+            candidate = rgb.resize((upload_w, upload_h), resample=_get_lanczos_resample())
+        else:
+            candidate = rgb
+            upload_w, upload_h = candidate.size
+
+        for quality in (92, 88, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40):
+            buf = io.BytesIO()
+            candidate.save(buf, format="JPEG", quality=quality, optimize=True)
+            data = buf.getvalue()
+            if len(data) <= max_bytes:
+                scale_x = orig_w / float(upload_w)
+                scale_y = orig_h / float(upload_h)
+                return data, "image/jpeg", (upload_w, upload_h), scale_x, scale_y
+
+        dimension_scale *= 0.85
+
+    raise RuntimeError(
+        f"无法将图片压缩到 {max_bytes / (1024 * 1024):.1f}MB 以内（原图 {orig_w}x{orig_h}），"
+        "请降低步骤一输出分辨率或换用 dashscope 后端。"
+    )
+
+
+def _scale_gitee_detections_to_original(
+    detections: list[dict],
+    scale_x: float,
+    scale_y: float,
+    original_size: tuple[int, int],
+) -> list[dict]:
+    """
+    将上传图坐标系下的检测框映射回原图像素坐标。
+
+    Args:
+        detections (list[dict]): 上传图上的检测列表（含 x1/y1/x2/y2）。
+        scale_x (float): 水平缩放比（原图/上传图）。
+        scale_y (float): 垂直缩放比。
+        original_size (tuple[int, int]): 原图 (width, height)。
+
+    Returns:
+        scaled (list[dict]): 映射并裁剪到原图范围内的检测列表。
+    """
+    if scale_x == 1.0 and scale_y == 1.0:
+        return detections
+
+    max_w, max_h = original_size
+    scaled: list[dict] = []
+    for det in detections:
+        x1 = max(0, min(max_w, int(round(det["x1"] * scale_x))))
+        y1 = max(0, min(max_h, int(round(det["y1"] * scale_y))))
+        x2 = max(0, min(max_w, int(round(det["x2"] * scale_x))))
+        y2 = max(0, min(max_h, int(round(det["y2"] * scale_y))))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        scaled.append({**det, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+    return scaled
+
+
+def _xyxy_pixels_to_xyxy(box: list | tuple, width: int, height: int) -> Optional[tuple[int, int, int, int]]:
+    """
+    将像素坐标 xyxy 裁剪并取整到图像范围内。
+
+    Args:
+        box (list | tuple): [x1, y1, x2, y2] 浮点或整数。
+        width (int): 图像宽度。
+        height (int): 图像高度。
+
+    Returns:
+        xyxy (Optional[tuple[int, int, int, int]]): 有效像素框；退化框为 None。
+    """
     if not box or len(box) < 4:
         return None
     try:
-        cx, cy, bw, bh = [float(v) for v in box[:4]]
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
     except (TypeError, ValueError):
         return None
-
-    cx *= width
-    cy *= height
-    bw *= width
-    bh *= height
-
-    x1 = int(round(cx - bw / 2.0))
-    y1 = int(round(cy - bh / 2.0))
-    x2 = int(round(cx + bw / 2.0))
-    y2 = int(round(cy + bh / 2.0))
-
+    if x1 > x2:
+        x1, x2 = x2, x1
+    if y1 > y2:
+        y1, y2 = y2, y1
+    x1 = int(round(x1))
+    y1 = int(round(y1))
+    x2 = int(round(x2))
+    y2 = int(round(y2))
     x1 = max(0, min(width, x1))
     y1 = max(0, min(height, y1))
     x2 = max(0, min(width, x2))
     y2 = max(0, min(height, y2))
-
     if x2 <= x1 or y2 <= y1:
         return None
     return x1, y1, x2, y2
 
 
+def _call_gitee_sam3_api(
+    image_bytes: bytes,
+    image_mime: str,
+    prompt: str,
+    api_key: str,
+    mode: str,
+) -> dict:
+    """
+    调用模力方舟 SAM3 分割或目标检测 HTTP API。
+
+    Args:
+        image_bytes (bytes): 上传图二进制（通常为 JPEG）。
+        image_mime (str): MIME 类型，如 image/jpeg。
+        prompt (str): 文本提示词。
+        api_key (str): Bearer Token。
+        mode (str): ``segmentation`` 或 ``object-detection``。
+
+    Returns:
+        result (dict): API JSON 响应；非 dict 时返回空 dict。
+
+    Raises:
+        ValueError: 对应 URL 环境变量未配置。
+        Exception: HTTP 非 200 或响应含 error 字段。
+    """
+    url_key = (
+        "GITEE_SAM3_SEGMENTATION_URL"
+        if mode == "segmentation"
+        else "GITEE_SAM3_OBJECT_DETECTION_URL"
+    )
+    api_url = os.environ.get(url_key, "").strip()
+    if not api_url:
+        raise ValueError(f"缺少环境变量 {url_key}，请在项目根目录 .env 中配置")
+
+    ext = "jpg" if image_mime == "image/jpeg" else "png"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    data = {"model": GITEE_SAM3_MODEL, "prompt": prompt}
+    files = {"image": (f"figure.{ext}", io.BytesIO(image_bytes), image_mime)}
+    response = requests.post(
+        api_url,
+        headers=headers,
+        data=data,
+        files=files,
+        timeout=SAM3_API_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise Exception(f"模力方舟 SAM3 API 错误: {response.status_code} - {response.text[:500]}")
+    result = response.json()
+    if isinstance(result, dict) and result.get("error"):
+        raise Exception(f"模力方舟 SAM3 API 错误: {result.get('error')}")
+    return result if isinstance(result, dict) else {}
+
+
+def _extract_gitee_sam3_detections(response_json: dict, image_size: tuple[int, int]) -> list[dict]:
+    """
+    从模力方舟 SAM3 响应解析检测框列表。
+
+    Args:
+        response_json (dict): API 返回 JSON。
+        image_size (tuple[int, int]): 当前坐标系下的 (width, height)。
+
+    Returns:
+        detections (list[dict]): 含 x1/y1/x2/y2/score/label 的字典列表。
+    """
+    width, height = image_size
+    detections: list[dict] = []
+
+    segments = response_json.get("segments") if isinstance(response_json, dict) else None
+    if isinstance(segments, list):
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            bbox = seg.get("bbox")
+            xyxy = _xyxy_pixels_to_xyxy(bbox, width, height)
+            if not xyxy:
+                continue
+            score = seg.get("confidence", seg.get("score"))
+            detections.append(
+                {
+                    "x1": xyxy[0],
+                    "y1": xyxy[1],
+                    "x2": xyxy[2],
+                    "y2": xyxy[3],
+                    "score": score,
+                    "label": seg.get("label"),
+                }
+            )
+        return detections
+
+    objects = response_json.get("objects") if isinstance(response_json, dict) else None
+    if isinstance(objects, list):
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            bbox = obj.get("bbox")
+            xyxy = _xyxy_pixels_to_xyxy(bbox, width, height)
+            if not xyxy:
+                continue
+            score = obj.get("confidence", obj.get("score"))
+            detections.append(
+                {
+                    "x1": xyxy[0],
+                    "y1": xyxy[1],
+                    "x2": xyxy[2],
+                    "y2": xyxy[3],
+                    "score": score,
+                    "label": obj.get("label"),
+                }
+            )
+
+    return detections
+
+
+def _image_to_base64(image: Image.Image) -> str:
+    """
+    将 PIL 图编码为 PNG Base64 字符串（无 data URI 前缀）。
+
+    Args:
+        image (Image.Image): 输入图片。
+
+    Returns:
+        b64 (str): Base64 编码字符串。
+    """
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
 def _polygon_to_bbox(points: list, width: int, height: int) -> Optional[tuple[int, int, int, int]]:
+    """
+    由多边形顶点计算轴对齐外接矩形并裁剪到图像内。
+
+    Args:
+        points (list): 顶点列表 [[x,y], ...]。
+        width (int): 图像宽度。
+        height (int): 图像高度。
+
+    Returns:
+        xyxy (Optional[tuple[int, int, int, int]]): 像素 xyxy；无效为 None。
+    """
     xs: list[float] = []
     ys: list[float] = []
 
@@ -770,42 +1294,17 @@ def _polygon_to_bbox(points: list, width: int, height: int) -> Optional[tuple[in
     return x1, y1, x2, y2
 
 
-def _extract_sam3_api_detections(response_json: dict, image_size: tuple[int, int]) -> list[dict]:
-    width, height = image_size
-    detections: list[dict] = []
-
-    metadata = response_json.get("metadata") if isinstance(response_json, dict) else None
-    if isinstance(metadata, list) and metadata:
-        for item in metadata:
-            if not isinstance(item, dict):
-                continue
-            box = item.get("box")
-            xyxy = _cxcywh_norm_to_xyxy(box, width, height)
-            if not xyxy:
-                continue
-            score = item.get("score")
-            detections.append(
-                {"x1": xyxy[0], "y1": xyxy[1], "x2": xyxy[2], "y2": xyxy[3], "score": score}
-            )
-        return detections
-
-    boxes = response_json.get("boxes") if isinstance(response_json, dict) else None
-    scores = response_json.get("scores") if isinstance(response_json, dict) else None
-    if isinstance(boxes, list) and boxes:
-        scores_list = scores if isinstance(scores, list) else []
-        for idx, box in enumerate(boxes):
-            xyxy = _cxcywh_norm_to_xyxy(box, width, height)
-            if not xyxy:
-                continue
-            score = scores_list[idx] if idx < len(scores_list) else None
-            detections.append(
-                {"x1": xyxy[0], "y1": xyxy[1], "x2": xyxy[2], "y2": xyxy[3], "score": score}
-            )
-
-    return detections
-
-
 def _extract_roboflow_detections(response_json: dict, image_size: tuple[int, int]) -> list[dict]:
+    """
+    从 Roboflow SAM3 多边形响应解析检测框。
+
+    Args:
+        response_json (dict): Roboflow API JSON。
+        image_size (tuple[int, int]): 原图 (width, height)。
+
+    Returns:
+        detections (list[dict]): 含 x1/y1/x2/y2/score 的列表。
+    """
     width, height = image_size
     detections: list[dict] = []
 
@@ -863,199 +1362,29 @@ def _extract_roboflow_detections(response_json: dict, image_size: tuple[int, int
     return detections
 
 
-def _unwrap_fal_sam3_payload(result) -> dict:
-    """Normalize fal SAM3 responses (sync, queue, or fal_client.subscribe)."""
-    if not isinstance(result, dict):
-        return {}
-    for key in ("metadata", "boxes", "masks", "scores", "image"):
-        if key in result:
-            return result
-    for wrapper in ("data", "output", "response"):
-        inner = result.get(wrapper)
-        if isinstance(inner, dict):
-            return _unwrap_fal_sam3_payload(inner)
-    return result
-
-
-def _sam3_fal_arguments(image_url: str, prompt: str, max_masks: int) -> dict:
-    return {
-        "image_url": image_url,
-        "prompt": prompt,
-        "apply_mask": False,
-        "return_multiple_masks": True,
-        "max_masks": max_masks,
-        "include_scores": True,
-        "include_boxes": True,
-    }
-
-
-def _sam3_fal_headers(api_key: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Key {api_key}",
-        "Content-Type": "application/json",
-    }
-
-
-def _call_sam3_fal_sync_http(arguments: dict, api_key: str) -> dict:
-    response = requests.post(
-        SAM3_FAL_SYNC_URL,
-        headers=_sam3_fal_headers(api_key),
-        json=arguments,
-        timeout=SAM3_API_TIMEOUT,
-    )
-    if response.status_code != 200:
-        raise Exception(f"SAM3 fal.ai 错误: {response.status_code} - {response.text[:500]}")
-    result = response.json()
-    if isinstance(result, dict) and result.get("error"):
-        raise Exception(f"SAM3 fal.ai 错误: {result.get('error')}")
-    return _unwrap_fal_sam3_payload(result)
-
-
-def _call_sam3_fal_queue_http(arguments: dict, api_key: str) -> dict:
-    headers = _sam3_fal_headers(api_key)
-    submit = requests.post(
-        SAM3_FAL_QUEUE_URL,
-        headers=headers,
-        json=arguments,
-        timeout=60,
-    )
-    if submit.status_code != 200:
-        raise Exception(f"SAM3 fal.ai 队列提交失败: {submit.status_code} - {submit.text[:500]}")
-    submit_json = submit.json()
-    if not isinstance(submit_json, dict):
-        raise Exception("SAM3 fal.ai 队列提交返回格式无效")
-
-    request_id = submit_json.get("request_id")
-    status_url = submit_json.get("status_url")
-    response_url = submit_json.get("response_url")
-    if not request_id:
-        raise Exception(f"SAM3 fal.ai 队列提交缺少 request_id: {submit_json}")
-
-    if not status_url:
-        status_url = f"{SAM3_FAL_QUEUE_URL}/requests/{request_id}/status"
-    if not response_url:
-        response_url = f"{SAM3_FAL_QUEUE_URL}/requests/{request_id}"
-
-    deadline = time.time() + SAM3_API_TIMEOUT
-    while time.time() < deadline:
-        status_resp = requests.get(
-            status_url,
-            headers=headers,
-            params={"logs": "1"},
-            timeout=60,
-        )
-        if status_resp.status_code != 200:
-            raise Exception(
-                f"SAM3 fal.ai 队列状态查询失败: {status_resp.status_code} - {status_resp.text[:500]}"
-            )
-        status_json = status_resp.json()
-        status = status_json.get("status") if isinstance(status_json, dict) else None
-        response_url = status_json.get("response_url") or response_url
-
-        if status == "COMPLETED":
-            if status_json.get("error"):
-                raise Exception(f"SAM3 fal.ai 推理失败: {status_json.get('error')}")
-            break
-        if status in ("FAILED", "CANCELLED"):
-            raise Exception(
-                f"SAM3 fal.ai 请求 {status}: {status_json.get('error') or status_json}"
-            )
-        if isinstance(status_json, dict) and status_json.get("error"):
-            raise Exception(f"SAM3 fal.ai 错误: {status_json.get('error')}")
-
-        logs = status_json.get("logs") if isinstance(status_json, dict) else None
-        if isinstance(logs, list) and logs:
-            last_msg = logs[-1].get("message") if isinstance(logs[-1], dict) else str(logs[-1])
-            if last_msg:
-                print(f"    fal: {last_msg}")
-
-        time.sleep(SAM3_FAL_QUEUE_POLL_INTERVAL)
-    else:
-        raise TimeoutError(f"SAM3 fal.ai 队列超时（>{SAM3_API_TIMEOUT}s）")
-
-    result_resp = requests.get(response_url, headers=headers, timeout=SAM3_API_TIMEOUT)
-    if result_resp.status_code != 200:
-        raise Exception(
-            f"SAM3 fal.ai 获取结果失败: {result_resp.status_code} - {result_resp.text[:500]}"
-        )
-    result = result_resp.json()
-    if isinstance(result, dict) and result.get("error"):
-        raise Exception(f"SAM3 fal.ai 错误: {result.get('error')}")
-    return _unwrap_fal_sam3_payload(result)
-
-
-def _call_sam3_fal_with_client(arguments: dict, api_key: str) -> dict:
-    import fal_client
-
-    prev_key = os.environ.get("FAL_KEY")
-    os.environ["FAL_KEY"] = api_key
-    try:
-
-        def on_queue_update(update) -> None:
-            status = getattr(update, "status", None)
-            if status is None and isinstance(update, dict):
-                status = update.get("status")
-            if status != "IN_PROGRESS":
-                return
-            logs = getattr(update, "logs", None)
-            if logs is None and isinstance(update, dict):
-                logs = update.get("logs")
-            if not isinstance(logs, list) or not logs:
-                return
-            last = logs[-1]
-            message = last.get("message") if isinstance(last, dict) else str(last)
-            if message:
-                print(f"    fal: {message}")
-
-        result = fal_client.subscribe(
-            SAM3_FAL_MODEL_ID,
-            arguments=arguments,
-            with_logs=True,
-            on_queue_update=on_queue_update,
-        )
-        return _unwrap_fal_sam3_payload(result)
-    finally:
-        if prev_key is None:
-            os.environ.pop("FAL_KEY", None)
-        else:
-            os.environ["FAL_KEY"] = prev_key
-
-
-def _call_sam3_api(
-    image_data_uri: str,
-    prompt: str,
-    api_key: str,
-    max_masks: int,
-) -> dict:
-    """Call fal-ai/sam-3/image (queue via fal_client, HTTP queue, or sync fallback)."""
-    arguments = _sam3_fal_arguments(image_data_uri, prompt, max_masks)
-    use_sync = os.environ.get("SAM3_FAL_USE_SYNC", "").strip().lower() in ("1", "true", "yes")
-    if use_sync:
-        return _call_sam3_fal_sync_http(arguments, api_key)
-
-    use_client = os.environ.get("SAM3_FAL_USE_CLIENT", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-    )
-    if use_client:
-        try:
-            return _call_sam3_fal_with_client(arguments, api_key)
-        except ImportError:
-            print("    提示: 安装 fal-client 可获得更稳定的队列调用 (pip install fal-client)")
-        except Exception as e:
-            print(f"    fal_client 调用失败，改用 HTTP 队列: {e}")
-
-    return _call_sam3_fal_queue_http(arguments, api_key)
-
-
 def _call_sam3_roboflow_api(
     image_base64: str,
     prompt: str,
     api_key: str,
     min_score: float,
 ) -> dict:
+    """
+    调用 Roboflow SAM3 concept_segment API（支持备用 URL 与重试）。
+
+    Args:
+        image_base64 (str): PNG 图片 Base64（无前缀）。
+        prompt (str): 文本提示词。
+        api_key (str): Roboflow API Key（拼入 query）。
+        min_score (float): 输出概率阈值 output_prob_thresh。
+
+    Returns:
+        result (dict): API JSON 响应体。
+
+    Raises:
+        RuntimeError: DNS 失败、全部 endpoint 重试耗尽或其它请求错误。
+    """
     def _redact_secret(text: str) -> str:
+        """脱敏日志中的 API Key。"""
         if not api_key:
             return text
         return text.replace(api_key, "***")
@@ -1067,6 +1396,7 @@ def _call_sam3_roboflow_api(
         "output_prob_thresh": min_score,
     }
     def _is_dns_error(exc: Exception) -> bool:
+        """判断异常是否为 DNS 解析失败。"""
         msg = str(exc)
         patterns = [
             "NameResolutionError",
@@ -1077,9 +1407,10 @@ def _call_sam3_roboflow_api(
         ]
         return any(p in msg for p in patterns)
 
+    primary_url = os.environ.get("ROBOFLOW_API_URL", "").strip() or DEFAULT_ROBOFLOW_API_URL
     fallback_urls_env = os.environ.get("ROBOFLOW_API_FALLBACK_URLS", "")
     fallback_urls = [u.strip() for u in fallback_urls_env.split(",") if u.strip()]
-    endpoint_urls = [SAM3_ROBOFLOW_API_URL] + [u for u in fallback_urls if u != SAM3_ROBOFLOW_API_URL]
+    endpoint_urls = [primary_url] + [u for u in fallback_urls if u != primary_url]
 
     retry_count_env = os.environ.get("SAM3_API_RETRIES", "3")
     retry_delay_env = os.environ.get("SAM3_API_RETRY_DELAY", "1.5")
@@ -1131,7 +1462,7 @@ def _call_sam3_roboflow_api(
             "可用修复：\n"
             "1) 在 docker-compose.yml 设置 dns（如 223.5.5.5 / 119.29.29.29）；\n"
             "2) 在 .env 里设置 ROBOFLOW_API_URL 或 ROBOFLOW_API_FALLBACK_URLS；\n"
-            "3) 临时在 .env 设置 AUTOFIGURE_SAM_BACKEND=fal 并配置 AUTOFIGURE_FAL_KEY。"
+            "3) 临时在 .env 设置 AUTOFIGURE_SAM_BACKEND=dashscope 或 roboflow。"
         ) from last_error
 
     if last_error is not None:
@@ -1141,10 +1472,31 @@ def _call_sam3_roboflow_api(
 
 
 def _get_dashscope_sam_api_key() -> str:
-    return _required_env(ENV_API_KEY)
+    """
+    dashscope SAM 后端复用百炼 API Key。
+
+    Returns:
+        api_key (str): AUTOFIGURE_API_KEY 的值。
+
+    Raises:
+        ValueError: 未配置时抛出。
+    """
+    value = os.environ.get("AUTOFIGURE_API_KEY", "").strip()
+    if not value:
+        raise ValueError("缺少环境变量 AUTOFIGURE_API_KEY，请在项目根目录 .env 中配置")
+    return value
 
 
 def _sam_dashscope_grounding_prompt(category: str) -> str:
+    """
+    构造 Qwen-VL 物体定位的用户提示词。
+
+    Args:
+        category (str): 检测类别词（如 icon）。
+
+    Returns:
+        prompt (str): 要求输出 JSON bbox_2d 数组的提示文本。
+    """
     return (
         f'检测图中所有「{category}」对象，以 JSON 数组输出，每个元素格式为 '
         f'{{"bbox_2d": [x1, y1, x2, y2], "label": "类别名"}}。'
@@ -1158,6 +1510,17 @@ def _qwen_vl_norm_box_to_xyxy(
     width: int,
     height: int,
 ) -> Optional[tuple[int, int, int, int]]:
+    """
+    将 Qwen-VL 的 bbox（0–999 归一化或像素）转为图像像素 xyxy。
+
+    Args:
+        box (list | tuple): 四个坐标值。
+        width (int): 图像宽度。
+        height (int): 图像高度。
+
+    Returns:
+        xyxy (Optional[tuple[int, int, int, int]]): 像素框；无效为 None。
+    """
     if not box or len(box) < 4:
         return None
     try:
@@ -1194,6 +1557,18 @@ def _qwen_vl_norm_box_to_xyxy(
 
 
 def _extract_json_payload_from_text(text: str) -> Any:
+    """
+    从模型回复文本中提取首个合法 JSON 对象或数组。
+
+    Args:
+        text (str): 原始回复，可含 markdown 代码块。
+
+    Returns:
+        payload (Any): 解析后的 dict 或 list。
+
+    Raises:
+        ValueError: 无法解析任何 JSON 时抛出。
+    """
     cleaned = text.strip()
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned, flags=re.IGNORECASE)
     if fence:
@@ -1212,6 +1587,20 @@ def _extract_json_payload_from_text(text: str) -> Any:
 
 
 def _parse_vl_grounding_boxes(text: str, width: int, height: int) -> list[dict]:
+    """
+    解析 Qwen-VL grounding JSON 为像素检测框列表。
+
+    Args:
+        text (str): 模型返回文本。
+        width (int): 图像宽度。
+        height (int): 图像高度。
+
+    Returns:
+        detections (list[dict]): 含 x1/y1/x2/y2/score/label 的列表。
+
+    Raises:
+        ValueError: JSON 结构不支持时抛出。
+    """
     payload = _extract_json_payload_from_text(text)
     items: list[Any]
     if isinstance(payload, list):
@@ -1263,6 +1652,18 @@ def _call_sam_dashscope_vl_grounding(
     api_key: str,
     model: str,
 ) -> list[dict]:
+    """
+    使用 DashScope Qwen-VL 对单张图做文本提示物体定位。
+
+    Args:
+        image (Image.Image): 输入图。
+        prompt (str): 检测类别词。
+        api_key (str): 百炼 API Key。
+        model (str): 多模态模型名。
+
+    Returns:
+        detections (list[dict]): 像素坐标检测框；无回复时为空列表。
+    """
     user_prompt = _sam_dashscope_grounding_prompt(prompt)
     response_text = _call_dashscope_chat_multimodal(
         [image, user_prompt],
@@ -1283,12 +1684,11 @@ def segment_with_sam3(
     text_prompts: str = "icon",
     min_score: float = 0.5,
     merge_threshold: float = 0.9,
-    sam_backend: SamBackendType = "fal",
-    sam_max_masks: int = 32,
+    sam_backend: SamBackendType = "dashscope",
     multimodal_model: Optional[str] = None,
 ) -> tuple[str, str, list]:
     """
-    使用 SAM3 / DashScope VL 分割图片，用灰色填充+黑色边框+序号标记，生成 boxlib.json
+    使用 SAM3 / DashScope VL / 模力方舟(gitee) 分割图片，用灰色填充+黑色边框+序号标记，生成 boxlib.json
 
     占位符样式：
     - 灰色填充 (#808080)
@@ -1296,14 +1696,18 @@ def segment_with_sam3(
     - 白色居中序号标签 (<AF>01, <AF>02, ...)
 
     Args:
-        image_path: 输入图片路径
-        output_dir: 输出目录
-        text_prompts: SAM3 文本提示，支持逗号分隔的多个prompt（如 "icon,diagram,arrow"）
-        min_score: 最低置信度阈值
-        merge_threshold: Box合并阈值，重叠比例超过此值则合并（0表示不合并，默认0.9）
+        image_path (str): 步骤一输出的 figure 图片路径。
+        output_dir (str): 运行输出目录。
+        text_prompts (str): 逗号分隔的检测词，每词单独请求一轮。
+        min_score (float): 最低置信度，低于此值的框丢弃。
+        merge_threshold (float): Box 合并重叠阈值；0 表示不合并。
+        sam_backend (SamBackendType): local/roboflow/dashscope/gitee。
+        multimodal_model (Optional[str]): dashscope 后端 VL 模型；None 用环境变量默认。
 
     Returns:
-        (samed_path, boxlib_path, valid_boxes)
+        samed_path (str): 灰色占位+序号标记图路径。
+        boxlib_path (str): boxlib.json 路径。
+        valid_boxes (list): 合并后的框列表（含 label、坐标、score）。
     """
     print("\n" + "=" * 60)
     print("步骤二：SAM3 分割 + 灰色填充+黑色边框+序号标记")
@@ -1325,8 +1729,11 @@ def segment_with_sam3(
     total_detected = 0
 
     backend = sam_backend
-    if backend == "api":
-        backend = "fal"
+    if backend in ("api", "fal"):
+        raise ValueError(
+            "SAM 后端 fal/api 已移除，请在 .env 设置 AUTOFIGURE_SAM_BACKEND 为 "
+            "dashscope、roboflow、gitee 或 local"
+        )
 
     if backend == "local":
         from sam3.model_builder import build_sam3_image_model
@@ -1378,39 +1785,6 @@ def segment_with_sam3(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    elif backend == "fal":
-        api_key = _get_fal_api_key()
-        max_masks = max(1, min(32, int(sam_max_masks)))
-        image_data_uri = _image_to_data_uri(image)
-        print(f"SAM3 fal.ai API 模式: max_masks={max_masks}")
-
-        for prompt in prompt_list:
-            print(f"\n  正在检测: '{prompt}'")
-            response_json = _call_sam3_api(
-                image_data_uri=image_data_uri,
-                prompt=prompt,
-                api_key=api_key,
-                max_masks=max_masks,
-            )
-            detections = _extract_sam3_api_detections(response_json, original_size)
-            prompt_count = 0
-            for det in detections:
-                score = det.get("score")
-                score_val = float(score) if score is not None else 0.0
-                if score_val >= min_score:
-                    x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
-                    all_detected_boxes.append({
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "score": score_val,
-                        "prompt": prompt  # 记录来源 prompt
-                    })
-                    prompt_count += 1
-                    print(f"    对象 {prompt_count}: ({x1}, {y1}, {x2}, {y2}), score={score_val:.3f}")
-                else:
-                    print(f"    跳过: score={score_val:.3f} < {min_score}")
-
-            print(f"  '{prompt}' 检测到 {prompt_count} 个有效对象")
-            total_detected += prompt_count
     elif backend == "roboflow":
         api_key = _get_roboflow_api_key()
         image_base64 = _image_to_base64(image)
@@ -1443,10 +1817,70 @@ def segment_with_sam3(
 
             print(f"  '{prompt}' 检测到 {prompt_count} 个有效对象")
             total_detected += prompt_count
+    elif backend == "gitee":
+        api_key = _get_gitee_api_key()
+        gitee_mode = _gitee_sam3_api_mode()
+        url_key = (
+            "GITEE_SAM3_SEGMENTATION_URL"
+            if gitee_mode == "segmentation"
+            else "GITEE_SAM3_OBJECT_DETECTION_URL"
+        )
+        api_url = os.environ.get(url_key, "").strip()
+        if not api_url:
+            raise ValueError(f"缺少环境变量 {url_key}，请在项目根目录 .env 中配置")
+        print(f"模力方舟 SAM3 API 模式: {gitee_mode} ({api_url})")
+        upload_bytes, upload_mime, upload_size, scale_x, scale_y = _prepare_gitee_sam3_upload(image)
+        if scale_x != 1.0 or scale_y != 1.0:
+            print(
+                "上传图已压缩以满足 5MB 限制: "
+                f"{original_size[0]}x{original_size[1]} -> {upload_size[0]}x{upload_size[1]}, "
+                f"{len(upload_bytes) / (1024 * 1024):.2f}MB ({upload_mime})"
+            )
+
+        for prompt in prompt_list:
+            print(f"\n  正在检测: '{prompt}'")
+            try:
+                response_json = _call_gitee_sam3_api(
+                    image_bytes=upload_bytes,
+                    image_mime=upload_mime,
+                    prompt=prompt,
+                    api_key=api_key,
+                    mode=gitee_mode,
+                )
+            except Exception as e:
+                print(f"    模力方舟 SAM3 调用失败: {e}")
+                response_json = {}
+
+            detections = _extract_gitee_sam3_detections(response_json, upload_size)
+            detections = _scale_gitee_detections_to_original(
+                detections, scale_x, scale_y, original_size
+            )
+            prompt_count = 0
+            for det in detections:
+                score = det.get("score")
+                score_val = float(score) if score is not None else 1.0
+                if score_val >= min_score:
+                    x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
+                    all_detected_boxes.append({
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2,
+                        "score": score_val,
+                        "prompt": prompt,
+                    })
+                    prompt_count += 1
+                    print(f"    对象 {prompt_count}: ({x1}, {y1}, {x2}, {y2}), score={score_val:.3f}")
+                else:
+                    print(f"    跳过: score={score_val:.3f} < {min_score}")
+
+            print(f"  '{prompt}' 检测到 {prompt_count} 个有效对象")
+            total_detected += prompt_count
     elif backend == "dashscope":
         api_key = _get_dashscope_sam_api_key()
-        vl_model = multimodal_model or _optional_env(
-            ENV_MULTIMODAL_MODEL, DEFAULT_MULTIMODAL_VL_MODEL
+        vl_model = multimodal_model or (
+            os.environ.get("AUTOFIGURE_MULTIMODAL_MODEL", "").strip()
+            or DEFAULT_MULTIMODAL_VL_MODEL
         )
         print(f"SAM DashScope VL 模式: model={vl_model}")
 
@@ -1582,14 +2016,20 @@ def segment_with_sam3(
 ALIYUN_IMAGESEG_ENDPOINT = "imageseg.cn-shanghai.aliyuncs.com"
 
 
-def _get_required_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not isinstance(value, str) or not value.strip():
-        raise RuntimeError(f"缺少环境变量 {name}，请在 .env 中配置后重试")
-    return value.strip()
-
-
 def _get_int_env(name: str, default: int) -> int:
+    """
+    读取整数环境变量。
+
+    Args:
+        name (str): 环境变量名。
+        default (int): 未设置或空字符串时的默认值。
+
+    Returns:
+        value (int): 解析后的整数。
+
+    Raises:
+        RuntimeError: 已设置但非合法整数时抛出。
+    """
     value = os.environ.get(name)
     if not isinstance(value, str) or not value.strip():
         return default
@@ -1600,15 +2040,44 @@ def _get_int_env(name: str, default: int) -> int:
 
 
 def _ensure_aliyun_imageseg_access_ready() -> None:
-    _get_required_env("ALIBABA_CLOUD_ACCESS_KEY_ID")
-    _get_required_env("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+    """
+    校验阿里云图像分割所需 AccessKey 环境变量已配置。
+
+    Returns:
+        None
+
+    Raises:
+        ValueError: 任一密钥缺失时抛出。
+    """
+    for name in ("ALIBABA_CLOUD_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_SECRET"):
+        if not os.environ.get(name, "").strip():
+            raise ValueError(f"缺少环境变量 {name}，请在项目根目录 .env 中配置")
 
 
 def _snake_to_pascal(value: str) -> str:
+    """
+    将 snake_case 转为 PascalCase（用于 Tea SDK 响应字段匹配）。
+
+    Args:
+        value (str): 下划线分隔字符串。
+
+    Returns:
+        pascal (str): 拼接后的 PascalCase 字符串。
+    """
     return "".join(part[:1].upper() + part[1:] for part in value.split("_") if part)
 
 
 def _read_tea_model_value(obj: Any, *keys: str) -> Any:
+    """
+    沿键路径读取阿里云 Tea SDK 模型字段（兼容 snake/Pascal 命名）。
+
+    Args:
+        obj (Any): Tea 模型实例或 dict。
+        *keys (str): 嵌套字段名序列。
+
+    Returns:
+        value (Any): 末端字段值；路径不存在时为 None。
+    """
     current = obj
     for key in keys:
         if current is None:
@@ -1632,6 +2101,16 @@ class AliyunImageSegRemover:
     """使用阿里云视觉智能开放平台通用分割接口进行背景抠图。"""
 
     def __init__(self, output_dir: Path | str | None = None):
+        """
+        初始化图像分割客户端并创建图标输出目录。
+
+        Args:
+            output_dir (Path | str | None): 去背景 PNG 保存目录；None 时用 ./output/icons。
+
+        Raises:
+            ValueError: 阿里云 AccessKey 未配置。
+            RuntimeError: 缺少 alibabacloud_imageseg SDK。
+        """
         _ensure_aliyun_imageseg_access_ready()
         self.output_dir = Path(output_dir) if output_dir else Path("./output/icons")
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1645,13 +2124,26 @@ class AliyunImageSegRemover:
             ) from e
 
         config = open_api_models.Config(
-            access_key_id=_get_required_env("ALIBABA_CLOUD_ACCESS_KEY_ID"),
-            access_key_secret=_get_required_env("ALIBABA_CLOUD_ACCESS_KEY_SECRET"),
+            access_key_id=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "").strip(),
+            access_key_secret=os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "").strip(),
         )
         config.endpoint = ALIYUN_IMAGESEG_ENDPOINT
         self.client = ImageSegClient(config)
 
     def remove_background(self, image: Image.Image, output_name: str) -> str:
+        """
+        对裁切图标调用通用分割去背景并保存 PNG。
+
+        Args:
+            image (Image.Image): 裁切后的 RGB/RGBA 图标。
+            output_name (str): 输出文件名前缀（不含 _nobg.png 后缀）。
+
+        Returns:
+            nobg_path (str): 透明背景 PNG 的完整路径。
+
+        Raises:
+            RuntimeError: API 无 ImageURL 或下载失败。
+        """
         try:
             from alibabacloud_imageseg20191230 import models as imageseg_models
             from alibabacloud_tea_util import models as util_models
@@ -1685,6 +2177,15 @@ class AliyunImageSegRemover:
 
     @staticmethod
     def _extract_result_image_url(response: Any) -> Optional[str]:
+        """
+        从分割 API 响应中提取结果图 URL。
+
+        Args:
+            response (Any): segment_common_image_advance 返回值。
+
+        Returns:
+            image_url (Optional[str]): 结果 PNG URL；未找到为 None。
+        """
         body = getattr(response, "body", response)
         image_url = _read_tea_model_value(body, "data", "image_url")
         if isinstance(image_url, str) and image_url.strip():
@@ -1696,6 +2197,19 @@ class AliyunImageSegRemover:
 
     @staticmethod
     def _download_result(image_url: str, out_path: Path) -> None:
+        """
+        下载分割结果图到本地（含 http→https 与重试）。
+
+        Args:
+            image_url (str): 阿里云返回的结果图 URL。
+            out_path (Path): 本地保存路径。
+
+        Returns:
+            None
+
+        Raises:
+            RuntimeError: 多次重试后仍失败。
+        """
         urls = [image_url]
         if image_url.startswith("http://"):
             urls.insert(0, "https://" + image_url[len("http://"):])
@@ -1728,9 +2242,16 @@ def crop_and_remove_background(
     rmbg_model_path: Optional[str] = None,
 ) -> list[dict]:
     """
-    根据 boxlib.json 裁切图片并使用阿里云通用图像分割去背景
+    步骤三：根据 boxlib.json 裁切图标并调用阿里云通用分割去背景。
 
-    文件命名使用 label: icon_AF01.png, icon_AF01_nobg.png
+    Args:
+        image_path (str): figure.png 路径。
+        boxlib_path (str): 步骤二生成的 boxlib.json。
+        output_dir (str): 输出根目录，图标写入其下 icons/。
+        rmbg_model_path (Optional[str]): 已废弃，仅打印提示。
+
+    Returns:
+        icon_infos (list[dict]): 每项含 label、路径、裁切坐标与尺寸。
     """
     print("\n" + "=" * 60)
     print("步骤三：裁切 + 阿里云通用图像分割去背景")
@@ -1805,10 +2326,18 @@ def generate_svg_template(
     使用多模态 LLM 生成 SVG 代码
 
     Args:
-        placeholder_mode: 占位符模式
-            - "none": 无特殊样式
-            - "box": 传入 boxlib 坐标
-            - "label": 灰色填充+黑色边框+序号标签（推荐）
+        figure_path (str): 原图 figure.png 路径。
+        samed_path (str): 带占位标记的 samed.png 路径。
+        boxlib_path (str): boxlib.json 路径。
+        output_path (str): 输出 template.svg 路径。
+        api_key (str): 百炼 API Key。
+        model (str): 多模态 SVG 生成模型。
+        base_url (str): OpenAI 兼容端点。
+        placeholder_mode (PlaceholderMode): none/box/label 占位符策略。
+        no_icon_mode (bool): 无检测框时是否生成纯复现 SVG。
+
+    Returns:
+        output_path (str): 保存的 SVG 模板路径。
     """
     print("\n" + "=" * 60)
     print("步骤四：多模态调用生成 SVG")
@@ -1934,7 +2463,15 @@ Please output ONLY the SVG code, starting with <svg and ending with </svg>. Do n
 
 
 def extract_svg_code(content: str) -> Optional[str]:
-    """从响应内容中提取 SVG 代码"""
+    """
+    从 LLM 回复中提取 SVG 源码。
+
+    Args:
+        content (str): 模型原始回复或含 markdown 代码块文本。
+
+    Returns:
+        svg_code (Optional[str]): 提取的 <svg>...</svg>；失败为 None。
+    """
     pattern = r'(<svg[\s\S]*?</svg>)'
     match = re.search(pattern, content, re.IGNORECASE)
     if match:
@@ -1958,7 +2495,16 @@ def extract_svg_code(content: str) -> Optional[str]:
 # ============================================================================
 
 def validate_svg_syntax(svg_code: str) -> tuple[bool, list[str]]:
-    """使用 lxml 解析验证 SVG 语法"""
+    """
+    使用 lxml（或内置 xml.etree）验证 SVG/XML 语法。
+
+    Args:
+        svg_code (str): SVG 源码字符串。
+
+    Returns:
+        is_valid (bool): 是否通过解析。
+        errors (list[str]): 错误信息列表；通过时为空。
+    """
     try:
         from lxml import etree
         etree.fromstring(svg_code.encode('utf-8'))
@@ -1993,7 +2539,20 @@ def fix_svg_with_llm(
     base_url: str = DASHSCOPE_BASE_URL,
     max_retries: int = 3,
 ) -> str:
-    """使用 LLM 修复 SVG 语法错误"""
+    """
+    使用 LLM 根据解析器错误信息迭代修复 SVG。
+
+    Args:
+        svg_code (str): 含语法错误的 SVG。
+        errors (list[str]): validate_svg_syntax 返回的错误列表。
+        api_key (str): 百炼 API Key。
+        model (str): 修复用文本模型。
+        base_url (str): OpenAI 兼容端点。
+        max_retries (int): 最大修复轮数。
+
+    Returns:
+        fixed_svg (str): 修复后或最后一轮输出的 SVG 字符串。
+    """
     print("\n  " + "-" * 50)
     print("  检测到 SVG 语法错误，调用 LLM 修复...")
     print("  " + "-" * 50)
@@ -2072,7 +2631,18 @@ def check_and_fix_svg(
     model: str,
     base_url: str = DASHSCOPE_BASE_URL,
 ) -> str:
-    """检查 SVG 语法并在需要时调用 LLM 修复"""
+    """
+    步骤 4.5：校验 SVG 语法，失败则调用 LLM 修复。
+
+    Args:
+        svg_code (str): 待校验 SVG 源码。
+        api_key (str): 百炼 API Key。
+        model (str): 修复模型名称。
+        base_url (str): OpenAI 兼容端点。
+
+    Returns:
+        svg_code (str): 通过校验或修复后的 SVG。
+    """
     print("\n" + "-" * 50)
     print("步骤 4.5：SVG 语法验证（使用 lxml XML 解析器）")
     print("-" * 50)
@@ -2099,7 +2669,16 @@ def check_and_fix_svg(
 # ============================================================================
 
 def get_svg_dimensions(svg_code: str) -> tuple[Optional[float], Optional[float]]:
-    """从 SVG 代码中提取坐标系尺寸"""
+    """
+    从 SVG 源码解析逻辑宽高（优先 viewBox，其次 width/height 属性）。
+
+    Args:
+        svg_code (str): SVG 字符串。
+
+    Returns:
+        width (Optional[float]): 逻辑宽度；无法解析为 None。
+        height (Optional[float]): 逻辑高度；无法解析为 None。
+    """
     viewbox_pattern = r'viewBox=["\']([^"\']+)["\']'
     viewbox_match = re.search(viewbox_pattern, svg_code, re.IGNORECASE)
 
@@ -2115,6 +2694,7 @@ def get_svg_dimensions(svg_code: str) -> tuple[Optional[float], Optional[float]]
                 pass
 
     def parse_dimension(attr_name: str) -> Optional[float]:
+        """从 SVG 根元素解析 width 或 height 数值部分。"""
         pattern = rf'{attr_name}=["\']([^"\']+)["\']'
         match = re.search(pattern, svg_code, re.IGNORECASE)
         if match:
@@ -2142,7 +2722,19 @@ def calculate_scale_factors(
     svg_width: float,
     svg_height: float,
 ) -> tuple[float, float]:
-    """计算从 figure.png 像素坐标到 SVG 坐标的缩放因子"""
+    """
+    计算 figure 像素坐标到 SVG 用户坐标的缩放比。
+
+    Args:
+        figure_width (int): 原图宽度（像素）。
+        figure_height (int): 原图高度（像素）。
+        svg_width (float): SVG 逻辑宽度。
+        svg_height (float): SVG 逻辑高度。
+
+    Returns:
+        scale_x (float): 水平缩放因子。
+        scale_y (float): 垂直缩放因子。
+    """
     scale_x = svg_width / figure_width
     scale_y = svg_height / figure_height
     return scale_x, scale_y
@@ -2163,11 +2755,14 @@ def replace_icons_in_svg(
     将透明背景图标替换到 SVG 中的占位符
 
     Args:
-        template_svg_path: SVG 模板路径
-        icon_infos: 图标信息列表
-        output_path: 输出路径
-        scale_factors: 坐标缩放因子
-        match_by_label: 是否使用序号匹配（label 模式）
+        template_svg_path (str): 优化后的 SVG 模板路径。
+        icon_infos (list[dict]): 步骤三图标信息（含 nobg_path、label、坐标）。
+        output_path (str): 最终 final.svg 路径。
+        scale_factors (tuple[float, float]): (scale_x, scale_y) 坐标映射。
+        match_by_label (bool): True 时按 <AF> 序号匹配占位符。
+
+    Returns:
+        output_path (str): 写入后的 SVG 路径。
     """
     print("\n" + "=" * 60)
     print("步骤五：图标替换到 SVG")
@@ -2368,14 +2963,32 @@ def replace_icons_in_svg(
 # ============================================================================
 
 def count_base64_images(svg_code: str) -> int:
-    """统计 SVG 中嵌入的 base64 图片数量"""
+    """
+    统计 SVG 中 data URI 内嵌 base64 图片数量。
+
+    Args:
+        svg_code (str): SVG 源码。
+
+    Returns:
+        count (int): href/xlink:href 中 base64 图片出现次数。
+    """
     pattern = r'(?:href|xlink:href)=["\']data:image/[^;]+;base64,[A-Za-z0-9+/=]+'
     matches = re.findall(pattern, svg_code)
     return len(matches)
 
 
 def validate_base64_images(svg_code: str, expected_count: int) -> tuple[bool, str]:
-    """验证 SVG 中的 base64 图片是否完整"""
+    """
+    校验 SVG 内嵌 base64 图片数量与数据完整性。
+
+    Args:
+        svg_code (str): SVG 源码。
+        expected_count (int): 期望的图片数量（优化前统计值）。
+
+    Returns:
+        ok (bool): 是否通过校验。
+        message (str): 说明信息（成功或失败原因）。
+    """
     actual_count = count_base64_images(svg_code)
 
     if actual_count < expected_count:
@@ -2393,7 +3006,17 @@ def validate_base64_images(svg_code: str, expected_count: int) -> tuple[bool, st
 
 
 def svg_to_png(svg_path: str, output_path: str, scale: float = 1.0) -> Optional[str]:
-    """将 SVG 转换为 PNG"""
+    """
+    将 SVG 文件栅格化为 PNG（优先 cairosvg，回退 svglib）。
+
+    Args:
+        svg_path (str): 输入 SVG 文件路径。
+        output_path (str): 输出 PNG 路径。
+        scale (float): 渲染缩放倍数。
+
+    Returns:
+        output_path (Optional[str]): 成功时返回输出路径；库缺失或失败为 None。
+    """
     try:
         import cairosvg
         cairosvg.svg2png(url=svg_path, write_to=output_path, scale=scale)
@@ -2433,18 +3056,19 @@ def optimize_svg_with_llm(
     使用 LLM 优化 SVG，使其与原图更加对齐
 
     Args:
-        figure_path: 原图路径
-        samed_path: 标记图路径
-        final_svg_path: 输入 SVG 路径
-        output_path: 输出 SVG 路径
-        api_key: API Key
-        model: 模型名称
-        base_url: API base URL
-        max_iterations: 最大迭代次数（0 表示跳过优化）
-        skip_base64_validation: 是否跳过 base64 图片验证
+        figure_path (str): 原图 figure.png 路径。
+        samed_path (str): 标记图 samed.png 路径。
+        final_svg_path (str): 待优化的 SVG 输入路径。
+        output_path (str): 优化结果 SVG 输出路径。
+        api_key (str): 百炼 API Key。
+        model (str): 多模态优化模型。
+        base_url (str): OpenAI 兼容端点。
+        max_iterations (int): 最大迭代次数；0 表示直接复制跳过。
+        skip_base64_validation (bool): 是否跳过内嵌图数量校验（模板阶段为 True）。
+        no_icon_mode (bool): 无图标时禁止 LLM 添加占位框。
 
     Returns:
-        优化后的 SVG 路径
+        output_path (str): 优化后 SVG 文件路径。
     """
     print("\n" + "=" * 60)
     print("步骤 4.6：LLM 优化 SVG（位置和样式对齐）")
@@ -2646,22 +3270,51 @@ def method_to_svg(
     input_figure_path: Optional[str] = None,
 ) -> dict:
     """
-    完整流程：Paper Method → SVG with Icons
+    主流程：Paper Method 文本或导入图 → 生图 → 检测 → 抠图 → SVG → 图标替换。
 
-    Provider、API Key、模型名等均从 .env 读取（见 load_app_config）。
+    Provider、API Key、模型名等从 .env 在运行时读取。
+
+    Args:
+        method_text (Optional[str]): 论文方法正文；与 input_figure_path 二选一。
+        output_dir (str): 输出目录，默认 ./output。
+        min_score (float): SAM 检测最低置信度。
+        rmbg_model_path (Optional[str]): 已废弃。
+        stop_after (int): 执行到第几步后停止（1–5）。
+        placeholder_mode (PlaceholderMode): SVG 占位符模式。
+        optimize_iterations (int): 步骤 4.6 LLM 优化轮数，0 跳过。
+        merge_threshold (float): 步骤二 box 合并重叠阈值。
+        image_size (str): 步骤一生图分辨率 1K/2K/4K。
+        enable_upscale (bool): 步骤一后是否 4K 长边放大。
+        input_figure_path (Optional[str]): 跳过生图，直接导入 figure。
 
     Returns:
-        结果字典
+        result (dict): 含 figure_path、samed_path、boxlib_path、icon_infos、
+            template_svg_path、optimized_template_path、final_svg_path 等键。
     """
-    cfg = load_app_config()
-    api_key = cfg["api_key"]
-    base_url = cfg["base_url"]
-    image_gen_model = cfg["image_gen_model"]
-    svg_gen_model = cfg["svg_gen_model"]
-    sam_prompts = cfg["sam_prompts"]
-    sam_backend = cfg["sam_backend"]
-    sam_max_masks = cfg["sam_max_masks"]
-    multimodal_model = cfg["multimodal_model"]
+    api_key = os.environ.get("AUTOFIGURE_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("缺少环境变量 AUTOFIGURE_API_KEY，请在项目根目录 .env 中配置")
+    base_url = DASHSCOPE_BASE_URL
+    image_gen_base_url = DASHSCOPE_IMAGE_GENERATION_URL
+    image_gen_model = (
+        os.environ.get("AUTOFIGURE_IMAGE_MODEL", "").strip() or DEFAULT_IMAGE_MODEL
+    )
+    svg_gen_model = os.environ.get("AUTOFIGURE_SVG_MODEL", "").strip() or DEFAULT_SVG_MODEL
+    multimodal_model = (
+        os.environ.get("AUTOFIGURE_MULTIMODAL_MODEL", "").strip()
+        or DEFAULT_MULTIMODAL_VL_MODEL
+    )
+    sam_prompts = (
+        os.environ.get("AUTOFIGURE_SAM_PROMPT", "").strip()
+        or "icon,robot,animal,person"
+    )
+    sam_backend_raw = os.environ.get("AUTOFIGURE_SAM_BACKEND", "").strip() or "dashscope"
+    if sam_backend_raw in ("api", "fal"):
+        raise ValueError(
+            "SAM 后端 fal/api 已移除，请在 .env 设置 AUTOFIGURE_SAM_BACKEND 为 "
+            "dashscope、roboflow、gitee 或 local"
+        )
+    sam_backend = cast(SamBackendType, sam_backend_raw)
     if input_figure_path is None and not method_text:
         raise ValueError("未提供 method_text，且未指定 input_figure_path")
 
@@ -2678,15 +3331,15 @@ def method_to_svg(
         print(f"导入图片: {input_figure_path}")
     else:
         print(f"生图模型: {image_gen_model}")
+        print(f"生图尺寸: {_resolve_dashscope_image_size(image_size)}")
     print(f"SVG模型: {svg_gen_model}")
     print(f"SAM提示词: {sam_prompts}")
     print(f"最低置信度: {min_score}")
-    sam_backend_value = "fal" if sam_backend == "api" else sam_backend
-    print(f"SAM后端: {sam_backend_value}")
-    if sam_backend_value == "fal":
-        print(f"SAM3 API max_masks: {sam_max_masks}")
-    if sam_backend_value == "dashscope":
+    print(f"SAM后端: {sam_backend}")
+    if sam_backend == "dashscope":
         print(f"多模态定位模型: {multimodal_model}")
+    if sam_backend == "gitee":
+        print(f"模力方舟 SAM3 接口: {_gitee_sam3_api_mode()}")
     print(f"执行到步骤: {stop_after}")
     print(f"占位符模式: {placeholder_mode}")
     print(f"优化迭代次数: {optimize_iterations}")
@@ -2708,6 +3361,8 @@ def method_to_svg(
             output_path=str(figure_path),
             api_key=api_key,
             model=image_gen_model,
+            base_url=image_gen_base_url,
+            image_size=image_size,
             enable_upscale=enable_upscale,
         )
 
@@ -2732,8 +3387,7 @@ def method_to_svg(
         text_prompts=sam_prompts,
         min_score=min_score,
         merge_threshold=merge_threshold,
-        sam_backend=sam_backend_value,
-        sam_max_masks=sam_max_masks,
+        sam_backend=sam_backend,
         multimodal_model=multimodal_model,
     )
 
@@ -2915,7 +3569,16 @@ def create_embedded_figure_svg(
     figure_path: str,
     output_path: str,
 ) -> str:
-    """Wrap the generated raster figure in a minimal SVG as a final fallback."""
+    """
+    无图标或 SVG 生成失败时，将 raster figure 内嵌为保底 SVG。
+
+    Args:
+        figure_path (str): figure.png 路径。
+        output_path (str): 输出 SVG 路径。
+
+    Returns:
+        output_path (str): 写入的 SVG 文件路径。
+    """
     figure_img = Image.open(figure_path)
     width, height = figure_img.size
     buf = io.BytesIO()
