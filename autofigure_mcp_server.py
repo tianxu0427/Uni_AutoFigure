@@ -15,9 +15,13 @@ MCP 工具列表:
     - autofigure_start_await: 启动生成任务并等待完成后返回
 
 环境变量（从 .env 加载）:
-    AUTOFIGURE_API_KEY: 百炼 API Key
-    AUTOFIGURE_IMAGE_MODEL: 生图模型（默认 wan2.6-t2i）
-    AUTOFIGURE_SVG_MODEL: SVG 生成模型（默认 qwen3.6-plus）
+    各模块独立配置见 .env.example（IMAGE_* / MULTIMODAL_* / SVG_FIX_* / SAM_VL_*）
+    AUTOFIGURE_IMAGE_PROVIDER: 生图供应商 dashscope | openai
+    AUTOFIGURE_IMAGE_MODEL: 生图模型（万相默认 wan2.6-t2i；openai 默认 gpt-image-2）
+    AUTOFIGURE_IMAGE_API_KEY / AUTOFIGURE_IMAGE_BASE_URL: openai 生图专用（如 CloseAI）
+    模块1 AUTOFIGURE_IMAGE_*: 文生图（步骤一）
+    模块2 AUTOFIGURE_MULTIMODAL_*: 多模态 VL + SVG（步骤二/四/五）
+    模块3 AUTOFIGURE_SVG_FIX_*: SVG 语法修复纯文本（步骤 4.5/4.6）
     AUTOFIGURE_SAM_BACKEND: SAM 后端（dashscope/roboflow/gitee/local）
     AUTOFIGURE_SAM_PROMPT: SAM 检测提示词
     ALIBABA_CLOUD_ACCESS_KEY_ID: 阿里云图像分割 AccessKey
@@ -482,12 +486,15 @@ MCP 连接地址:
     )
     args = parser.parse_args()
 
-    # 检查环境变量
-    api_key = os.environ.get("AUTOFIGURE_API_KEY", "").strip()
-    if not api_key:
-        logger.warning(
-            "AUTOFIGURE_API_KEY 未配置。请在 .env 文件中设置。"
-        )
+    # 检查环境变量（各模块独立 Key，启动任务时由 autofigure2 校验）
+    for env_name in (
+        "AUTOFIGURE_IMAGE_API_KEY",
+        "AUTOFIGURE_MULTIMODAL_API_KEY",
+        "AUTOFIGURE_SVG_FIX_API_KEY",
+        "AUTOFIGURE_SAM_VL_API_KEY",
+    ):
+        if not os.environ.get(env_name, "").strip():
+            logger.warning("%s 未配置，相关步骤可能无法运行。", env_name)
 
     # 检查阿里云配置
     aly_key = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID", "").strip()

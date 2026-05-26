@@ -1,7 +1,7 @@
 """
 Paper Method 到 SVG 图标替换完整流程 (Label 模式增强版 + Box合并 + 多Prompt支持)
 
-API：阿里云百炼 DashScope（通义万相生图 + 通义千问/Qwen-VL 多模态）
+API：步骤一可选万相或 OpenAI Images（gpt-image-2 等）；其余步骤默认百炼 DashScope
 
 占位符模式 (--placeholder_mode):
 - none: 无特殊样式（默认黑色边框）
@@ -95,9 +95,25 @@ DASHSCOPE_IMAGE_GENERATION_URL = (
     "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 )
 
-# --- 模型默认值（.env：AUTOFIGURE_IMAGE_MODEL / SVG_MODEL / MULTIMODAL_MODEL）---
-DEFAULT_IMAGE_MODEL = "wan2.6-t2i"  # 步骤一：paper method → 学术示意图
-DEFAULT_SVG_MODEL = "qwen3.6-plus"  # 步骤四/五：生成与优化 SVG 模板
+# --- 步骤一生图供应商（.env：AUTOFIGURE_IMAGE_PROVIDER）---
+ImageProviderType = Literal["dashscope", "openai"]
+DEFAULT_IMAGE_PROVIDER: ImageProviderType = "dashscope"
+DEFAULT_OPENAI_IMAGE_BASE_URL = "https://api.openai-proxy.org/v1"  # CloseAI 国内中转
+DEFAULT_OPENAI_IMAGE_MODEL = "gpt-image-2"
+
+# --- 多模态 / SVG 修复：OpenAI 兼容供应商（.env：AUTOFIGURE_*_PROVIDER）---
+LLMProviderType = Literal["dashscope", "openai"]
+DEFAULT_MULTIMODAL_PROVIDER: LLMProviderType = "dashscope"
+DEFAULT_SVG_FIX_PROVIDER: LLMProviderType = "dashscope"
+DEFAULT_OPENAI_MULTIMODAL_MODEL = "gemini-3.1-flash-lite"
+DEFAULT_OPENAI_SVG_FIX_MODEL = "gpt-4o-mini"
+
+# --- 模型默认值 ---
+DEFAULT_IMAGE_MODEL = "wan2.6-t2i"  # 步骤一（dashscope）文生图
+DEFAULT_MULTIMODAL_MODEL = "qwen3.6-plus"  # 步骤二 VL + 步骤四/五 SVG（多模态）
+DEFAULT_SVG_FIX_MODEL = "qwen-plus"  # 步骤 4.5 SVG 语法修复（纯文本）
+
+MultimodalProviderType = LLMProviderType  # 兼容旧类型名
 
 # --- 占位符与步骤一后处理 ---
 PlaceholderMode = Literal["none", "box", "label"]  # CLI --placeholder_mode
@@ -112,9 +128,10 @@ SAM3_API_TIMEOUT = 300  # Roboflow / 模力方舟 HTTP 请求超时（秒）
 GITEE_SAM3_MODEL = "sam3"  # 模力方舟请求体 model 字段
 GITEE_SAM3_MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 平台硬上限 5MB
 GITEE_SAM3_UPLOAD_TARGET_BYTES = int(4.8 * 1024 * 1024)  # 压缩目标，留余量
-DEFAULT_MULTIMODAL_VL_MODEL = "qwen3-vl-plus"  # dashscope 后端：Qwen-VL 物体定位
-SAM_DASHSCOPE_VL_MAX_TOKENS = 4096  # dashscope 后端 grounding 回复最大 token
-SamBackendType = Literal["local", "roboflow", "dashscope", "gitee"]
+SamBackendType = Literal["local", "roboflow", "gitee", "vllm"]
+DEFAULT_SAM_BACKEND: SamBackendType = "vllm"
+SAM_VL_MAX_TOKENS = 4096  # vllm 后端（VLM 物体定位）回复最大 token
+SAM_DASHSCOPE_VL_MAX_TOKENS = SAM_VL_MAX_TOKENS  # 兼容旧名
 
 # --- 步骤一参考图（CLI --use_reference_image / --reference_image_path 会覆盖）---
 USE_REFERENCE_IMAGE = False
@@ -172,7 +189,7 @@ def call_llm_multimodal(
     Returns:
         content (Optional[str]): 模型回复文本。
     """
-    return _call_dashscope_chat_multimodal(
+    return _call_openai_compatible_chat_multimodal(
         contents, api_key, model, base_url, max_tokens, temperature
     )
 
@@ -184,21 +201,32 @@ def call_llm_image_generation(
     base_url: str = DASHSCOPE_IMAGE_GENERATION_URL,
     reference_image: Optional[Image.Image] = None,
     image_size: str = DEFAULT_UPSCALE_IMAGE_SIZE,
+    provider: ImageProviderType = DEFAULT_IMAGE_PROVIDER,
 ) -> Optional[Image.Image]:
     """
-    通义万相文生图（wan 系列等多模态生图接口）。
+    步骤一文生图（按 provider 路由到万相或 OpenAI Images API）。
 
     Args:
         prompt (str): 生图提示词。
-        api_key (str): 百炼 API Key。
+        api_key (str): 对应供应商 API Key。
         model (str): 生图模型名称。
-        base_url (str): 万相生图 REST 端点。
+        base_url (str): API 端点（万相 REST 或 OpenAI 兼容 base，需含 /v1）。
         reference_image (Optional[Image.Image]): 可选参考图（风格迁移）。
         image_size (str): 分辨率档位 1K/2K/4K。
+        provider (ImageProviderType): dashscope（万相）或 openai（Images API）。
 
     Returns:
-        image (Optional[Image.Image]): 下载后的 PIL 图片。
+        image (Optional[Image.Image]): 生成后的 PIL 图片。
     """
+    if provider == "openai":
+        return _call_openai_image_generation(
+            prompt=prompt,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            reference_image=reference_image,
+            image_size=image_size,
+        )
     return _call_dashscope_image_generation(
         prompt=prompt,
         api_key=api_key,
@@ -256,24 +284,26 @@ def _call_dashscope_chat_text(
         raise
 
 
-def _call_dashscope_chat_multimodal(
+def _call_openai_compatible_chat_multimodal(
     contents: List[Any],
     api_key: str,
     model: str,
     base_url: str,
     max_tokens: int = 16000,
     temperature: float = 0.7,
+    provider_label: str = "multimodal",
 ) -> Optional[str]:
     """
-    调用 DashScope OpenAI 兼容 Chat 多模态接口。
+    调用 OpenAI 兼容 Chat 多模态接口（DashScope / 中转 Gemini 等）。
 
     Args:
         contents (List[Any]): 文本与 PIL.Image 片段列表。
-        api_key (str): 百炼 API Key。
+        api_key (str): API Key。
         model (str): 多模态模型名称。
-        base_url (str): API base URL。
+        base_url (str): API base URL（须以 /v1 结尾）。
         max_tokens (int): 最大生成 token。
         temperature (float): 采样温度。
+        provider_label (str): 日志前缀。
 
     Returns:
         content (Optional[str]): 助手回复正文。
@@ -284,7 +314,10 @@ def _call_dashscope_chat_multimodal(
     try:
         from openai import OpenAI
 
-        client = OpenAI(base_url=base_url, api_key=api_key)
+        client = OpenAI(
+            base_url=_normalize_openai_base_url(base_url),
+            api_key=api_key,
+        )
 
         message_content: List[Dict[str, Any]] = []
         for part in contents:
@@ -308,8 +341,28 @@ def _call_dashscope_chat_multimodal(
 
         return completion.choices[0].message.content if completion and completion.choices else None
     except Exception as e:
-        print(f"[DashScope] 多模态 API 调用失败: {e}")
+        print(f"[{provider_label}] 多模态 API 调用失败: {e}")
         raise
+
+
+def _call_dashscope_chat_multimodal(
+    contents: List[Any],
+    api_key: str,
+    model: str,
+    base_url: str,
+    max_tokens: int = 16000,
+    temperature: float = 0.7,
+) -> Optional[str]:
+    """兼容旧名，转发至 _call_openai_compatible_chat_multimodal。"""
+    return _call_openai_compatible_chat_multimodal(
+        contents,
+        api_key,
+        model,
+        base_url,
+        max_tokens,
+        temperature,
+        provider_label="dashscope",
+    )
 
 
 def _pil_image_to_data_uri(image: Image.Image) -> str:
@@ -531,6 +584,322 @@ def _call_dashscope_image_generation(
         raise
 
 
+def _normalize_openai_base_url(base_url: str) -> str:
+    """
+    确保 OpenAI 兼容 base_url 以 /v1 结尾（CloseAI 等中转要求）。
+
+    Args:
+        base_url (str): 用户配置的 base URL。
+
+    Returns:
+        normalized (str): 规范化后的 base URL。
+    """
+    url = base_url.strip().rstrip("/")
+    if not url.endswith("/v1"):
+        url = f"{url}/v1"
+    return url
+
+
+def _resolve_openai_image_size(image_size: Optional[str]) -> str:
+    """
+    将 CLI/配置的 image_size 映射为 OpenAI Images API 的 size 参数字符串。
+
+    Args:
+        image_size (Optional[str]): 1K、2K 或 4K；None 与其它值按 4K 处理。
+
+    Returns:
+        size (str): 如 1024x1024、2560x1440、3840x2160。
+    """
+    if image_size == "1K":
+        return "1024x1024"
+    if image_size == "2K":
+        return "2560x1440"
+    return "3840x2160"
+
+
+def _openai_images_response_to_pil(response: Any) -> Image.Image:
+    """
+    从 OpenAI Images API 响应解析首张图片为 PIL.Image。
+
+    Args:
+        response: client.images.generate / edit 返回值。
+
+    Returns:
+        image (Image.Image): 解码后的图片。
+
+    Raises:
+        Exception: 响应中无 b64_json 或 url 时抛出。
+    """
+    if not response or not getattr(response, "data", None):
+        raise Exception("OpenAI Images API 响应为空")
+    item = response.data[0]
+    b64_json = getattr(item, "b64_json", None)
+    if b64_json:
+        return Image.open(io.BytesIO(base64.b64decode(b64_json)))
+    image_url = getattr(item, "url", None)
+    if image_url:
+        return _download_image_from_url(image_url)
+    raise Exception("OpenAI Images 响应中未找到 b64_json 或 url")
+
+
+def _call_openai_image_generation(
+    prompt: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    reference_image: Optional[Image.Image] = None,
+    image_size: str = DEFAULT_UPSCALE_IMAGE_SIZE,
+) -> Optional[Image.Image]:
+    """
+    调用 OpenAI 兼容 Images API（如 CloseAI 中转的 gpt-image-2）。
+
+    无参考图：images.generate；有参考图：images.edit。
+
+    Args:
+        prompt (str): 生图提示词。
+        api_key (str): API Key。
+        model (str): 如 gpt-image-2。
+        base_url (str): OpenAI 兼容端点，需含 /v1。
+        reference_image (Optional[Image.Image]): 可选参考图。
+        image_size (str): 1K/2K/4K 档位。
+
+    Returns:
+        image (Optional[Image.Image]): 生成的 PIL 图片。
+    """
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url=_normalize_openai_base_url(base_url),
+            api_key=api_key,
+        )
+        size = _resolve_openai_image_size(image_size)
+        common_kwargs: Dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "size": size,
+            "quality": "high",
+            "n": 1,
+        }
+
+        if reference_image is not None:
+            buf = io.BytesIO()
+            reference_image.convert("RGBA").save(buf, format="PNG")
+            buf.seek(0)
+            response = client.images.edit(
+                image=buf,
+                **common_kwargs,
+            )
+        else:
+            response = client.images.generate(**common_kwargs)
+
+        return _openai_images_response_to_pil(response)
+    except Exception as e:
+        print(f"[OpenAI Images] 图像生成 API 调用失败: {e}")
+        raise
+
+
+def _require_module_env(env_name: str, module_label: str) -> str:
+    """
+    读取模块必填环境变量。
+
+    Args:
+        env_name (str): 环境变量名。
+        module_label (str): 模块名称（用于报错）。
+
+    Returns:
+        value (str): 非空字符串。
+    """
+    value = os.environ.get(env_name, "").strip()
+    if not value:
+        raise ValueError(f"{module_label} 缺少环境变量 {env_name}，请在 .env 中配置")
+    return value
+
+
+def load_image_generation_config() -> Dict[str, str]:
+    """
+    模块 1：步骤一文生图（仅使用 AUTOFIGURE_IMAGE_*，不与其他模块共用变量）。
+
+    环境变量：
+        AUTOFIGURE_IMAGE_PROVIDER / _API_KEY / _BASE_URL / _MODEL
+
+    Returns:
+        config (dict): provider、api_key、base_url、model。
+    """
+    module_label = "模块1 文生图"
+    provider = cast(
+        ImageProviderType,
+        _resolve_llm_provider(
+            "AUTOFIGURE_IMAGE_PROVIDER", DEFAULT_IMAGE_PROVIDER, module_label
+        ),
+    )
+    api_key = _require_module_env("AUTOFIGURE_IMAGE_API_KEY", module_label)
+    model = (
+        os.environ.get("AUTOFIGURE_IMAGE_MODEL", "").strip()
+        or (DEFAULT_OPENAI_IMAGE_MODEL if provider == "openai" else DEFAULT_IMAGE_MODEL)
+    )
+
+    if provider == "openai":
+        base_url = _normalize_openai_base_url(
+            _require_module_env("AUTOFIGURE_IMAGE_BASE_URL", module_label)
+        )
+    else:
+        base_url = (
+            os.environ.get("AUTOFIGURE_IMAGE_BASE_URL", "").strip()
+            or DASHSCOPE_IMAGE_GENERATION_URL
+        )
+
+    return {
+        "provider": provider,
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+    }
+
+
+def _resolve_llm_provider(provider_env: str, default_provider: str, module_label: str) -> LLMProviderType:
+    """
+    解析并校验 LLM 模块的 provider 环境变量。
+
+    Args:
+        provider_env (str): 环境变量名。
+        default_provider (str): 默认值。
+        module_label (str): 模块中文名，用于报错。
+
+    Returns:
+        provider (LLMProviderType): dashscope 或 openai。
+    """
+    provider_raw = os.environ.get(provider_env, "").strip().lower() or default_provider
+    if provider_raw not in ("dashscope", "openai"):
+        raise ValueError(
+            f"{provider_env} 仅支持 dashscope 或 openai，当前为: {provider_raw!r}（{module_label}）"
+        )
+    return cast(LLMProviderType, provider_raw)
+
+
+def _load_openai_compatible_module_config(
+    *,
+    module_label: str,
+    provider_env: str,
+    default_provider: str,
+    model_env: str,
+    default_model_dashscope: str,
+    default_model_openai: str,
+    api_key_env: str,
+    base_url_env: str,
+    default_base_url_dashscope: str = DASHSCOPE_BASE_URL,
+) -> Dict[str, str]:
+    """
+    加载可切换 dashscope / OpenAI 兼容中转的 LLM 模块配置。
+
+    每个模块仅使用各自的 PROVIDER / API_KEY / BASE_URL / MODEL，不跨模块回退。
+
+    Returns:
+        config (dict): provider、api_key、base_url、model。
+    """
+    provider = _resolve_llm_provider(provider_env, default_provider, module_label)
+    api_key = _require_module_env(api_key_env, module_label)
+    base_url_raw = _require_module_env(base_url_env, module_label)
+    model = (
+        os.environ.get(model_env, "").strip()
+        or (default_model_openai if provider == "openai" else default_model_dashscope)
+    )
+
+    if provider == "openai":
+        base_url = _normalize_openai_base_url(base_url_raw)
+    else:
+        base_url = (
+            base_url_raw
+            if base_url_raw.startswith("http")
+            else default_base_url_dashscope
+        )
+
+    return {"provider": provider, "api_key": api_key, "base_url": base_url, "model": model}
+
+
+def _normalize_sam_backend(raw: str) -> SamBackendType:
+    """
+    解析 AUTOFIGURE_SAM_BACKEND；dashscope 为旧值，等价于 vllm。
+
+    Args:
+        raw (str): 环境变量或 CLI 传入的后端名。
+
+    Returns:
+        backend (SamBackendType): 规范化后的后端。
+    """
+    value = raw.strip().lower()
+    if value == "dashscope":
+        print("提示: AUTOFIGURE_SAM_BACKEND=dashscope 已更名为 vllm，请更新 .env")
+        return "vllm"
+    if value in ("api", "fal"):
+        raise ValueError(
+            "SAM 后端 fal/api 已移除，请在 .env 设置 AUTOFIGURE_SAM_BACKEND 为 "
+            "vllm、roboflow、gitee 或 local"
+        )
+    if value not in ("local", "roboflow", "gitee", "vllm"):
+        raise ValueError(
+            f"AUTOFIGURE_SAM_BACKEND 仅支持 vllm、roboflow、gitee、local，当前为: {raw!r}"
+        )
+    return cast(SamBackendType, value)
+
+
+def load_sam_vl_config() -> Dict[str, str]:
+    """
+    步骤二 SAM（vllm 后端）VLM 物体定位（仅 AUTOFIGURE_SAM_VL_*）。
+
+    环境变量：
+        AUTOFIGURE_SAM_VL_PROVIDER / _API_KEY / _BASE_URL / _MODEL
+    """
+    return _load_openai_compatible_module_config(
+        module_label="步骤二 SAM-VL",
+        provider_env="AUTOFIGURE_SAM_VL_PROVIDER",
+        default_provider=DEFAULT_MULTIMODAL_PROVIDER,
+        model_env="AUTOFIGURE_SAM_VL_MODEL",
+        default_model_dashscope=DEFAULT_MULTIMODAL_MODEL,
+        default_model_openai=DEFAULT_OPENAI_MULTIMODAL_MODEL,
+        api_key_env="AUTOFIGURE_SAM_VL_API_KEY",
+        base_url_env="AUTOFIGURE_SAM_VL_BASE_URL",
+    )
+
+
+def load_multimodal_config() -> Dict[str, str]:
+    """
+    模块 2：多模态 LLM（步骤四/五 SVG 生成与优化）。
+
+    环境变量：
+        AUTOFIGURE_MULTIMODAL_PROVIDER / _API_KEY / _BASE_URL / _MODEL
+    """
+    return _load_openai_compatible_module_config(
+        module_label="多模态",
+        provider_env="AUTOFIGURE_MULTIMODAL_PROVIDER",
+        default_provider=DEFAULT_MULTIMODAL_PROVIDER,
+        model_env="AUTOFIGURE_MULTIMODAL_MODEL",
+        default_model_dashscope=DEFAULT_MULTIMODAL_MODEL,
+        default_model_openai=DEFAULT_OPENAI_MULTIMODAL_MODEL,
+        api_key_env="AUTOFIGURE_MULTIMODAL_API_KEY",
+        base_url_env="AUTOFIGURE_MULTIMODAL_BASE_URL",
+    )
+
+
+def load_svg_fix_config() -> Dict[str, str]:
+    """
+    模块 3：纯文本 LLM（步骤 4.5 / 4.6 中 SVG XML 语法修复）。
+
+    环境变量：
+        AUTOFIGURE_SVG_FIX_PROVIDER / _API_KEY / _BASE_URL / _MODEL
+    """
+    return _load_openai_compatible_module_config(
+        module_label="SVG 语法修复",
+        provider_env="AUTOFIGURE_SVG_FIX_PROVIDER",
+        default_provider=DEFAULT_SVG_FIX_PROVIDER,
+        model_env="AUTOFIGURE_SVG_FIX_MODEL",
+        default_model_dashscope=DEFAULT_SVG_FIX_MODEL,
+        default_model_openai=DEFAULT_OPENAI_SVG_FIX_MODEL,
+        api_key_env="AUTOFIGURE_SVG_FIX_API_KEY",
+        base_url_env="AUTOFIGURE_SVG_FIX_BASE_URL",
+    )
+
+
 # ============================================================================
 # 步骤一：调用 LLM 生成图片
 # ============================================================================
@@ -646,20 +1015,22 @@ def generate_figure_from_method(
     reference_image_path: Optional[str] = None,
     image_size: str = DEFAULT_UPSCALE_IMAGE_SIZE,
     enable_upscale: bool = True,
+    provider: ImageProviderType = DEFAULT_IMAGE_PROVIDER,
 ) -> str:
     """
-    步骤一：根据 paper method 文本调用万相生成学术示意图。
+    步骤一：根据 paper method 文本生成学术示意图。
 
     Args:
         method_text (str): 论文方法章节文本。
         output_path (str): 输出 figure.png 路径。
-        api_key (str): 百炼 API Key。
+        api_key (str): 生图 API Key。
         model (str): 生图模型名称。
-        base_url (str): 万相生图 API 端点。
+        base_url (str): 生图 API 端点。
         use_reference_image (Optional[bool]): 是否使用参考图；None 时用全局 USE_REFERENCE_IMAGE。
         reference_image_path (Optional[str]): 参考图路径；None 时用全局 REFERENCE_IMAGE_PATH。
         image_size (str): 1K/2K/4K。
         enable_upscale (bool): 生图后是否放大至 4K 长边。
+        provider (ImageProviderType): dashscope 或 openai。
 
     Returns:
         output_path (str): 保存后的图片路径。
@@ -667,9 +1038,13 @@ def generate_figure_from_method(
     print("=" * 60)
     print("步骤一：使用 LLM 生成学术风格图片")
     print("=" * 60)
-    print("Provider: dashscope")
+    print(f"Provider: {provider}")
     print(f"模型: {model}")
-    print(f"生图尺寸: {_resolve_dashscope_image_size(image_size)}")
+    if provider == "openai":
+        print(f"生图尺寸: {_resolve_openai_image_size(image_size)}")
+        print(f"API Base: {_normalize_openai_base_url(base_url)}")
+    else:
+        print(f"生图尺寸: {_resolve_dashscope_image_size(image_size)}")
     print(f"4K等比例放大: {'开启' if enable_upscale else '关闭'}")
 
     if use_reference_image is None:
@@ -726,6 +1101,7 @@ The figure should be engaging and using academic journal style with cute charact
         base_url=base_url,
         reference_image=reference_image,
         image_size=image_size,
+        provider=provider,
     )
 
     if img is None:
@@ -741,6 +1117,8 @@ The figure should be engaging and using academic journal style with cute charact
             )
         else:
             print(f"图片长边已达到 4K，无需放大: {original_size[0]} x {original_size[1]}")
+    elif provider == "openai" and image_size == "4K":
+        print("OpenAI 生图已请求 4K 尺寸，跳过后续等比例放大")
 
     # 确保输出目录存在
     output_path = Path(output_path)
@@ -1462,7 +1840,7 @@ def _call_sam3_roboflow_api(
             "可用修复：\n"
             "1) 在 docker-compose.yml 设置 dns（如 223.5.5.5 / 119.29.29.29）；\n"
             "2) 在 .env 里设置 ROBOFLOW_API_URL 或 ROBOFLOW_API_FALLBACK_URLS；\n"
-            "3) 临时在 .env 设置 AUTOFIGURE_SAM_BACKEND=dashscope 或 roboflow。"
+            "3) 临时在 .env 设置 AUTOFIGURE_SAM_BACKEND=vllm 或 roboflow。"
         ) from last_error
 
     if last_error is not None:
@@ -1471,23 +1849,7 @@ def _call_sam3_roboflow_api(
     raise RuntimeError("SAM3 Roboflow 请求失败：未知错误")
 
 
-def _get_dashscope_sam_api_key() -> str:
-    """
-    dashscope SAM 后端复用百炼 API Key。
-
-    Returns:
-        api_key (str): AUTOFIGURE_API_KEY 的值。
-
-    Raises:
-        ValueError: 未配置时抛出。
-    """
-    value = os.environ.get("AUTOFIGURE_API_KEY", "").strip()
-    if not value:
-        raise ValueError("缺少环境变量 AUTOFIGURE_API_KEY，请在项目根目录 .env 中配置")
-    return value
-
-
-def _sam_dashscope_grounding_prompt(category: str) -> str:
+def _sam_vl_grounding_prompt(category: str) -> str:
     """
     构造 Qwen-VL 物体定位的用户提示词。
 
@@ -1646,36 +2008,55 @@ def _parse_vl_grounding_boxes(text: str, width: int, height: int) -> list[dict]:
     return detections
 
 
+def _call_sam_vl_grounding(
+    image: Image.Image,
+    prompt: str,
+    api_key: str,
+    model: str,
+    base_url: str = DASHSCOPE_BASE_URL,
+    provider_label: str = "vllm",
+) -> list[dict]:
+    """
+    使用 VLM 对单张图做文本提示物体定位（AUTOFIGURE_SAM_VL_* 配置的 OpenAI 兼容接口）。
+
+    Args:
+        image (Image.Image): 输入图。
+        prompt (str): 检测类别词。
+        api_key (str): API Key。
+        model (str): VLM 模型名。
+        base_url (str): OpenAI 兼容端点。
+        provider_label (str): 日志前缀。
+
+    Returns:
+        detections (list[dict]): 像素坐标检测框；无回复时为空列表。
+    """
+    user_prompt = _sam_vl_grounding_prompt(prompt)
+    response_text = _call_openai_compatible_chat_multimodal(
+        [image, user_prompt],
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        max_tokens=SAM_VL_MAX_TOKENS,
+        temperature=0.1,
+        provider_label=provider_label,
+    )
+    if not response_text:
+        return []
+    return _parse_vl_grounding_boxes(response_text, image.size[0], image.size[1])
+
+
 def _call_sam_dashscope_vl_grounding(
     image: Image.Image,
     prompt: str,
     api_key: str,
     model: str,
+    base_url: str = DASHSCOPE_BASE_URL,
+    provider_label: str = "dashscope",
 ) -> list[dict]:
-    """
-    使用 DashScope Qwen-VL 对单张图做文本提示物体定位。
-
-    Args:
-        image (Image.Image): 输入图。
-        prompt (str): 检测类别词。
-        api_key (str): 百炼 API Key。
-        model (str): 多模态模型名。
-
-    Returns:
-        detections (list[dict]): 像素坐标检测框；无回复时为空列表。
-    """
-    user_prompt = _sam_dashscope_grounding_prompt(prompt)
-    response_text = _call_dashscope_chat_multimodal(
-        [image, user_prompt],
-        api_key=api_key,
-        model=model,
-        base_url=DASHSCOPE_BASE_URL,
-        max_tokens=SAM_DASHSCOPE_VL_MAX_TOKENS,
-        temperature=0.1,
+    """兼容旧函数名，转发至 _call_sam_vl_grounding。"""
+    return _call_sam_vl_grounding(
+        image, prompt, api_key, model, base_url, provider_label
     )
-    if not response_text:
-        return []
-    return _parse_vl_grounding_boxes(response_text, image.size[0], image.size[1])
 
 
 def segment_with_sam3(
@@ -1684,8 +2065,11 @@ def segment_with_sam3(
     text_prompts: str = "icon",
     min_score: float = 0.5,
     merge_threshold: float = 0.9,
-    sam_backend: SamBackendType = "dashscope",
+    sam_backend: SamBackendType = DEFAULT_SAM_BACKEND,
     multimodal_model: Optional[str] = None,
+    multimodal_api_key: Optional[str] = None,
+    multimodal_base_url: Optional[str] = None,
+    multimodal_provider: Optional[str] = None,
 ) -> tuple[str, str, list]:
     """
     使用 SAM3 / DashScope VL / 模力方舟(gitee) 分割图片，用灰色填充+黑色边框+序号标记，生成 boxlib.json
@@ -1701,8 +2085,11 @@ def segment_with_sam3(
         text_prompts (str): 逗号分隔的检测词，每词单独请求一轮。
         min_score (float): 最低置信度，低于此值的框丢弃。
         merge_threshold (float): Box 合并重叠阈值；0 表示不合并。
-        sam_backend (SamBackendType): local/roboflow/dashscope/gitee。
-        multimodal_model (Optional[str]): dashscope 后端 VL 模型；None 用环境变量默认。
+        sam_backend (SamBackendType): local/roboflow/vllm/gitee。
+        multimodal_model (Optional[str]): vllm 后端 VLM 模型；None 用环境变量加载。
+        multimodal_api_key (Optional[str]): 多模态 API Key；None 时从环境变量加载。
+        multimodal_base_url (Optional[str]): 多模态 OpenAI 兼容端点。
+        multimodal_provider (Optional[str]): dashscope 或 openai，用于日志。
 
     Returns:
         samed_path (str): 灰色占位+序号标记图路径。
@@ -1728,12 +2115,7 @@ def segment_with_sam3(
     all_detected_boxes = []
     total_detected = 0
 
-    backend = sam_backend
-    if backend in ("api", "fal"):
-        raise ValueError(
-            "SAM 后端 fal/api 已移除，请在 .env 设置 AUTOFIGURE_SAM_BACKEND 为 "
-            "dashscope、roboflow、gitee 或 local"
-        )
+    backend = _normalize_sam_backend(str(sam_backend))
 
     if backend == "local":
         from sam3.model_builder import build_sam3_image_model
@@ -1876,25 +2258,30 @@ def segment_with_sam3(
 
             print(f"  '{prompt}' 检测到 {prompt_count} 个有效对象")
             total_detected += prompt_count
-    elif backend == "dashscope":
-        api_key = _get_dashscope_sam_api_key()
-        vl_model = multimodal_model or (
-            os.environ.get("AUTOFIGURE_MULTIMODAL_MODEL", "").strip()
-            or DEFAULT_MULTIMODAL_VL_MODEL
+    elif backend == "vllm":
+        sam_vl_cfg = load_sam_vl_config()
+        api_key = multimodal_api_key or sam_vl_cfg["api_key"]
+        base_url = multimodal_base_url or sam_vl_cfg["base_url"]
+        vl_model = multimodal_model or sam_vl_cfg["model"]
+        provider_label = multimodal_provider or sam_vl_cfg["provider"]
+        print(
+            f"SAM VLM 定位 (vllm): provider={provider_label}, model={vl_model}, "
+            f"base={_normalize_openai_base_url(base_url)}"
         )
-        print(f"SAM DashScope VL 模式: model={vl_model}")
 
         for prompt in prompt_list:
             print(f"\n  正在检测: '{prompt}'")
             try:
-                detections = _call_sam_dashscope_vl_grounding(
+                detections = _call_sam_vl_grounding(
                     image=image,
                     prompt=prompt,
                     api_key=api_key,
                     model=vl_model,
+                    base_url=base_url,
+                    provider_label=provider_label,
                 )
             except Exception as e:
-                print(f"    DashScope VL 调用失败: {e}")
+                print(f"    VLM 定位调用失败: {e}")
                 detections = []
 
             prompt_count = 0
@@ -2014,6 +2401,48 @@ def segment_with_sam3(
 # ============================================================================
 
 ALIYUN_IMAGESEG_ENDPOINT = "imageseg.cn-shanghai.aliyuncs.com"
+ALIYUN_IMAGESEG_MIN_SIDE = 32
+
+
+def _ensure_min_side_for_imageseg(
+    image: Image.Image,
+    min_side: int = ALIYUN_IMAGESEG_MIN_SIDE,
+) -> tuple[Image.Image, bool]:
+    """
+    确保图像宽高均不低于阿里云通用分割 API 的最小边长要求。
+
+    较短边不足时先按比例放大；若舍入后仍不足，再以透明边居中补齐。
+
+    Args:
+        image (Image.Image): 裁切后的图标。
+        min_side (int): 最小边长像素，默认 32。
+
+    Returns:
+        prepared (Image.Image): RGBA 图，宽高均 >= min_side。
+        adjusted (bool): 是否做过放大或补边。
+    """
+    width, height = image.size
+    if width >= min_side and height >= min_side:
+        return image, False
+    if width <= 0 or height <= 0:
+        raise ValueError(f"无效裁切尺寸: {width}x{height}")
+
+    scale = max(min_side / width, min_side / height)
+    new_width = max(min_side, int(round(width * scale)))
+    new_height = max(min_side, int(round(height * scale)))
+
+    working = image.convert("RGBA")
+    prepared = working.resize((new_width, new_height), resample=_get_lanczos_resample())
+
+    w, h = prepared.size
+    if w >= min_side and h >= min_side:
+        return prepared, True
+
+    canvas_w = max(w, min_side)
+    canvas_h = max(h, min_side)
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    canvas.paste(prepared, ((canvas_w - w) // 2, (canvas_h - h) // 2))
+    return canvas, True
 
 
 def _get_int_env(name: str, default: int) -> int:
@@ -2288,7 +2717,16 @@ def crop_and_remove_background(
         crop_path = icons_dir / f"icon_{label_clean}.png"
         cropped.save(crop_path)
 
-        nobg_path = remover.remove_background(cropped, f"icon_{label_clean}")
+        api_image, size_adjusted = _ensure_min_side_for_imageseg(cropped)
+        if size_adjusted:
+            orig_w, orig_h = cropped.size
+            api_w, api_h = api_image.size
+            print(
+                f"  {label}: 裁切 {orig_w}x{orig_h} 低于 API 最小边长 {ALIYUN_IMAGESEG_MIN_SIDE}，"
+                f"已调整为 {api_w}x{api_h} 后去背景"
+            )
+
+        nobg_path = remover.remove_background(api_image, f"icon_{label_clean}")
 
         icon_infos.append({
             "id": box_id,
@@ -2321,6 +2759,11 @@ def generate_svg_template(
     base_url: str = DASHSCOPE_BASE_URL,
     placeholder_mode: PlaceholderMode = "label",
     no_icon_mode: bool = False,
+    multimodal_provider: str = "dashscope",
+    svg_fix_api_key: Optional[str] = None,
+    svg_fix_model: Optional[str] = None,
+    svg_fix_base_url: Optional[str] = None,
+    svg_fix_provider: Optional[str] = None,
 ) -> str:
     """
     使用多模态 LLM 生成 SVG 代码
@@ -2335,15 +2778,27 @@ def generate_svg_template(
         base_url (str): OpenAI 兼容端点。
         placeholder_mode (PlaceholderMode): none/box/label 占位符策略。
         no_icon_mode (bool): 无检测框时是否生成纯复现 SVG。
+        multimodal_provider (str): dashscope 或 openai。
+        svg_fix_api_key (Optional[str]): 步骤 4.5 语法修复 API Key；None 时从环境变量加载。
+        svg_fix_model (Optional[str]): 步骤 4.5 纯文本修复模型。
+        svg_fix_base_url (Optional[str]): 步骤 4.5 API Base。
+        svg_fix_provider (Optional[str]): 步骤 4.5 供应商。
 
     Returns:
         output_path (str): 保存的 SVG 模板路径。
     """
+    fix_cfg = load_svg_fix_config()
+    fix_api_key = svg_fix_api_key or fix_cfg["api_key"]
+    fix_model = svg_fix_model or fix_cfg["model"]
+    fix_base_url = svg_fix_base_url or fix_cfg["base_url"]
+    fix_provider = svg_fix_provider or fix_cfg["provider"]
+
     print("\n" + "=" * 60)
     print("步骤四：多模态调用生成 SVG")
     print("=" * 60)
-    print("Provider: dashscope")
+    print(f"多模态 Provider: {multimodal_provider}")
     print(f"模型: {model}")
+    print(f"API Base: {_normalize_openai_base_url(base_url)}")
     print(f"占位符模式: {placeholder_mode}")
     if no_icon_mode:
         print("无图标模式: 启用纯 SVG 复现回退")
@@ -2444,12 +2899,13 @@ Please output ONLY the SVG code, starting with <svg and ending with </svg>. Do n
     if not svg_code:
         raise Exception('无法从响应中提取 SVG 代码')
 
-    # 步骤 4.5：SVG 语法验证和修复
+    # 步骤 4.5：SVG 语法验证和修复（纯文本模块，与多模态配置分离）
     svg_code = check_and_fix_svg(
         svg_code=svg_code,
-        api_key=api_key,
-        model=model,
-        base_url=base_url,
+        api_key=fix_api_key,
+        model=fix_model,
+        base_url=fix_base_url,
+        provider=fix_provider,
     )
 
     output_path = Path(output_path)
@@ -2538,6 +2994,7 @@ def fix_svg_with_llm(
     model: str,
     base_url: str = DASHSCOPE_BASE_URL,
     max_retries: int = 3,
+    provider: str = "dashscope",
 ) -> str:
     """
     使用 LLM 根据解析器错误信息迭代修复 SVG。
@@ -2549,12 +3006,13 @@ def fix_svg_with_llm(
         model (str): 修复用文本模型。
         base_url (str): OpenAI 兼容端点。
         max_retries (int): 最大修复轮数。
+        provider (str): dashscope 或 openai。
 
     Returns:
         fixed_svg (str): 修复后或最后一轮输出的 SVG 字符串。
     """
     print("\n  " + "-" * 50)
-    print("  检测到 SVG 语法错误，调用 LLM 修复...")
+    print(f"  检测到 SVG 语法错误，调用 LLM 修复（provider={provider}, model={model}）...")
     print("  " + "-" * 50)
     for err in errors:
         print(f"    {err}")
@@ -2630,21 +3088,23 @@ def check_and_fix_svg(
     api_key: str,
     model: str,
     base_url: str = DASHSCOPE_BASE_URL,
+    provider: str = "dashscope",
 ) -> str:
     """
     步骤 4.5：校验 SVG 语法，失败则调用 LLM 修复。
 
     Args:
         svg_code (str): 待校验 SVG 源码。
-        api_key (str): 百炼 API Key。
-        model (str): 修复模型名称。
+        api_key (str): API Key。
+        model (str): 纯文本修复模型名称。
         base_url (str): OpenAI 兼容端点。
+        provider (str): dashscope 或 openai。
 
     Returns:
         svg_code (str): 通过校验或修复后的 SVG。
     """
     print("\n" + "-" * 50)
-    print("步骤 4.5：SVG 语法验证（使用 lxml XML 解析器）")
+    print(f"步骤 4.5：SVG 语法验证（lxml）；修复模块 provider={provider}, model={model}")
     print("-" * 50)
 
     is_valid, errors = validate_svg_syntax(svg_code)
@@ -2660,6 +3120,7 @@ def check_and_fix_svg(
             api_key=api_key,
             model=model,
             base_url=base_url,
+            provider=provider,
         )
         return fixed_svg
 
@@ -3051,6 +3512,11 @@ def optimize_svg_with_llm(
     max_iterations: int = 2,
     skip_base64_validation: bool = False,
     no_icon_mode: bool = False,
+    multimodal_provider: str = "dashscope",
+    svg_fix_api_key: Optional[str] = None,
+    svg_fix_model: Optional[str] = None,
+    svg_fix_base_url: Optional[str] = None,
+    svg_fix_provider: Optional[str] = None,
 ) -> str:
     """
     使用 LLM 优化 SVG，使其与原图更加对齐
@@ -3066,15 +3532,27 @@ def optimize_svg_with_llm(
         max_iterations (int): 最大迭代次数；0 表示直接复制跳过。
         skip_base64_validation (bool): 是否跳过内嵌图数量校验（模板阶段为 True）。
         no_icon_mode (bool): 无图标时禁止 LLM 添加占位框。
+        multimodal_provider (str): dashscope 或 openai。
+        svg_fix_api_key (Optional[str]): 语法修复 API Key。
+        svg_fix_model (Optional[str]): 语法修复模型。
+        svg_fix_base_url (Optional[str]): 语法修复 API Base。
+        svg_fix_provider (Optional[str]): 语法修复供应商。
 
     Returns:
         output_path (str): 优化后 SVG 文件路径。
     """
+    fix_cfg = load_svg_fix_config()
+    fix_api_key = svg_fix_api_key or fix_cfg["api_key"]
+    fix_model = svg_fix_model or fix_cfg["model"]
+    fix_base_url = svg_fix_base_url or fix_cfg["base_url"]
+    fix_provider = svg_fix_provider or fix_cfg["provider"]
+
     print("\n" + "=" * 60)
     print("步骤 4.6：LLM 优化 SVG（位置和样式对齐）")
     print("=" * 60)
-    print("Provider: dashscope")
+    print(f"多模态 Provider: {multimodal_provider}")
     print(f"模型: {model}")
+    print(f"API Base: {_normalize_openai_base_url(base_url)}")
     print(f"最大迭代次数: {max_iterations}")
     if no_icon_mode:
         print("无图标模式: 优化时禁止引入占位框")
@@ -3212,9 +3690,10 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
                 optimized_svg = fix_svg_with_llm(
                     svg_code=optimized_svg,
                     errors=errors,
-                    api_key=api_key,
-                    model=model,
-                    base_url=base_url,
+                    api_key=fix_api_key,
+                    model=fix_model,
+                    base_url=fix_base_url,
+                    provider=fix_provider,
                 )
 
             if not skip_base64_validation:
@@ -3291,30 +3770,42 @@ def method_to_svg(
         result (dict): 含 figure_path、samed_path、boxlib_path、icon_infos、
             template_svg_path、optimized_template_path、final_svg_path 等键。
     """
-    api_key = os.environ.get("AUTOFIGURE_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("缺少环境变量 AUTOFIGURE_API_KEY，请在项目根目录 .env 中配置")
-    base_url = DASHSCOPE_BASE_URL
-    image_gen_base_url = DASHSCOPE_IMAGE_GENERATION_URL
-    image_gen_model = (
-        os.environ.get("AUTOFIGURE_IMAGE_MODEL", "").strip() or DEFAULT_IMAGE_MODEL
+    image_cfg = load_image_generation_config()
+    image_provider = cast(ImageProviderType, image_cfg["provider"])
+    image_gen_api_key = image_cfg["api_key"]
+    image_gen_base_url = image_cfg["base_url"]
+    image_gen_model = image_cfg["model"]
+
+    sam_backend = _normalize_sam_backend(
+        os.environ.get("AUTOFIGURE_SAM_BACKEND", "").strip() or DEFAULT_SAM_BACKEND
     )
-    svg_gen_model = os.environ.get("AUTOFIGURE_SVG_MODEL", "").strip() or DEFAULT_SVG_MODEL
-    multimodal_model = (
-        os.environ.get("AUTOFIGURE_MULTIMODAL_MODEL", "").strip()
-        or DEFAULT_MULTIMODAL_VL_MODEL
-    )
+
+    mm_cfg = load_multimodal_config()
+    fix_cfg = load_svg_fix_config()
+    multimodal_provider = mm_cfg["provider"]
+    multimodal_model = mm_cfg["model"]
+    api_key = mm_cfg["api_key"]
+    base_url = mm_cfg["base_url"]
+    svg_fix_provider = fix_cfg["provider"]
+    svg_fix_model = fix_cfg["model"]
+    svg_fix_api_key = fix_cfg["api_key"]
+    svg_fix_base_url = fix_cfg["base_url"]
+
+    sam_vl_provider = ""
+    sam_vl_model = ""
+    sam_vl_api_key = ""
+    sam_vl_base_url = ""
+    if sam_backend == "vllm":
+        sam_vl_cfg = load_sam_vl_config()
+        sam_vl_provider = sam_vl_cfg["provider"]
+        sam_vl_model = sam_vl_cfg["model"]
+        sam_vl_api_key = sam_vl_cfg["api_key"]
+        sam_vl_base_url = sam_vl_cfg["base_url"]
+
     sam_prompts = (
         os.environ.get("AUTOFIGURE_SAM_PROMPT", "").strip()
         or "icon,robot,animal,person"
     )
-    sam_backend_raw = os.environ.get("AUTOFIGURE_SAM_BACKEND", "").strip() or "dashscope"
-    if sam_backend_raw in ("api", "fal"):
-        raise ValueError(
-            "SAM 后端 fal/api 已移除，请在 .env 设置 AUTOFIGURE_SAM_BACKEND 为 "
-            "dashscope、roboflow、gitee 或 local"
-        )
-    sam_backend = cast(SamBackendType, sam_backend_raw)
     if input_figure_path is None and not method_text:
         raise ValueError("未提供 method_text，且未指定 input_figure_path")
 
@@ -3324,20 +3815,33 @@ def method_to_svg(
     print("\n" + "=" * 60)
     print("Paper Method 到 SVG 图标替换流程 (Label 模式增强版 + Box合并)")
     print("=" * 60)
-    print("Provider: dashscope")
+    print(f"[模块1 文生图] provider={image_provider}, model={image_gen_model}")
+    if image_provider == "openai":
+        print(f"  API Base: {_normalize_openai_base_url(image_gen_base_url)}")
+    print(
+        f"[模块2 多模态] provider={multimodal_provider}, model={multimodal_model}, "
+        f"base={_normalize_openai_base_url(base_url)}"
+    )
+    print(
+        f"[模块3 SVG修复] provider={svg_fix_provider}, model={svg_fix_model}, "
+        f"base={_normalize_openai_base_url(svg_fix_base_url)}"
+    )
+    if sam_backend == "vllm":
+        print(
+            f"[步骤二 SAM-VL] provider={sam_vl_provider}, model={sam_vl_model}, "
+            f"base={_normalize_openai_base_url(sam_vl_base_url)}"
+        )
     print(f"输出目录: {output_dir}")
     if input_figure_path:
         print("输入模式: imported_figure")
         print(f"导入图片: {input_figure_path}")
+    elif image_provider == "openai":
+        print(f"生图尺寸: {_resolve_openai_image_size(image_size)}")
     else:
-        print(f"生图模型: {image_gen_model}")
         print(f"生图尺寸: {_resolve_dashscope_image_size(image_size)}")
-    print(f"SVG模型: {svg_gen_model}")
     print(f"SAM提示词: {sam_prompts}")
     print(f"最低置信度: {min_score}")
     print(f"SAM后端: {sam_backend}")
-    if sam_backend == "dashscope":
-        print(f"多模态定位模型: {multimodal_model}")
     if sam_backend == "gitee":
         print(f"模力方舟 SAM3 接口: {_gitee_sam3_api_mode()}")
     print(f"执行到步骤: {stop_after}")
@@ -3359,11 +3863,12 @@ def method_to_svg(
         generate_figure_from_method(
             method_text=method_text,
             output_path=str(figure_path),
-            api_key=api_key,
+            api_key=image_gen_api_key,
             model=image_gen_model,
             base_url=image_gen_base_url,
             image_size=image_size,
             enable_upscale=enable_upscale,
+            provider=image_provider,
         )
 
     if stop_after == 1:
@@ -3388,7 +3893,10 @@ def method_to_svg(
         min_score=min_score,
         merge_threshold=merge_threshold,
         sam_backend=sam_backend,
-        multimodal_model=multimodal_model,
+        multimodal_model=sam_vl_model,
+        multimodal_api_key=sam_vl_api_key,
+        multimodal_base_url=sam_vl_base_url,
+        multimodal_provider=sam_vl_provider,
     )
 
     no_icon_mode = len(valid_boxes) == 0
@@ -3449,10 +3957,15 @@ def method_to_svg(
             boxlib_path=boxlib_path,
             output_path=str(template_svg_path),
             api_key=api_key,
-            model=svg_gen_model,
+            model=multimodal_model,
             base_url=base_url,
             placeholder_mode=placeholder_mode,
             no_icon_mode=no_icon_mode,
+            multimodal_provider=multimodal_provider,
+            svg_fix_api_key=svg_fix_api_key,
+            svg_fix_model=svg_fix_model,
+            svg_fix_base_url=svg_fix_base_url,
+            svg_fix_provider=svg_fix_provider,
         )
 
         # 步骤 4.6：LLM 优化 SVG 模板（可配置迭代次数，0 表示跳过）
@@ -3462,11 +3975,16 @@ def method_to_svg(
             final_svg_path=str(template_svg_path),
             output_path=str(optimized_template_path),
             api_key=api_key,
-            model=svg_gen_model,
+            model=multimodal_model,
             base_url=base_url,
             max_iterations=optimize_iterations,
             skip_base64_validation=True,
             no_icon_mode=no_icon_mode,
+            multimodal_provider=multimodal_provider,
+            svg_fix_api_key=svg_fix_api_key,
+            svg_fix_model=svg_fix_model,
+            svg_fix_base_url=svg_fix_base_url,
+            svg_fix_provider=svg_fix_provider,
         )
     except Exception as exc:
         if not no_icon_mode:
