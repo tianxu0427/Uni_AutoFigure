@@ -174,7 +174,7 @@ except ImportError as e:
 
 mcp = FastMCP(
     "autofigure",
-    streamable_http_path="/mcp",  # Streamable HTTP 端点
+    streamable_http_path="/autofigure",  # Streamable HTTP 端点
 )
 
 
@@ -627,7 +627,7 @@ def main():
     python autofigure_mcp_server.py --host 0.0.0.0 --port 8765
 
 MCP 连接地址:
-    Streamable HTTP: http://127.0.0.1:8765/mcp
+    Streamable HTTP: http://127.0.0.1:8765/autofigure
         """
     )
     parser.add_argument(
@@ -665,7 +665,7 @@ MCP 连接地址:
     import uvicorn
 
     logger.info(f"Starting AutoFigure MCP Server on {args.host}:{args.port}")
-    logger.info(f"Streamable HTTP endpoint: http://{args.host}:{args.port}/mcp")
+    logger.info(f"Streamable HTTP endpoint: http://{args.host}:{args.port}/autofigure")
     logger.info(f"Health check: http://{args.host}:{args.port}/health")
 
     uvicorn.run(
