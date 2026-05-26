@@ -12,10 +12,7 @@ AutoFigure MCP Server - 学术配图生成服务
     gunicorn autofigure_mcp_server:create_app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8765
 
 MCP 工具列表:
-    - autofigure_start_job: 启动异步生成任务
-    - autofigure_get_job_status: 查询任务状态和进度
-    - autofigure_get_artifacts: 获取生成结果文件路径
-    - autofigure_list_jobs: 列出所有任务（可选）
+    - autofigure_start_await: 启动生成任务并等待完成后返回
 
 环境变量（从 .env 加载）:
     AUTOFIGURE_API_KEY: 百炼 API Key
@@ -152,15 +149,6 @@ job_manager = JobManager()
 # MCP 服务定义
 # ============================================================================
 
-def _effective_job_status(job: JobStatus) -> str:
-    """Return a consistent status even if an older job missed a status update."""
-    status = job.get("status", "pending")
-    if status == "pending" and job.get("progress") == 100 and job.get("current_step") == "completed":
-        return "completed"
-    if status == "pending" and job.get("current_step") == "failed":
-        return "failed"
-    return status
-
 try:
     from mcp.server.fastmcp import FastMCP
     from starlette.responses import JSONResponse
@@ -199,20 +187,8 @@ async def list_tools(request: Request) -> JSONResponse:
     return JSONResponse({
         "tools": [
             {
-                "name": "autofigure_start_job",
+                "name": "autofigure_start_await",
                 "description": "启动学术配图生成任务",
-            },
-            {
-                "name": "autofigure_get_job_status",
-                "description": "查询任务状态",
-            },
-            {
-                "name": "autofigure_get_artifacts",
-                "description": "获取生成结果",
-            },
-            {
-                "name": "autofigure_list_jobs",
-                "description": "列出所有任务",
             },
         ]
     })
@@ -223,17 +199,17 @@ async def list_tools(request: Request) -> JSONResponse:
 # ============================================================================
 
 @mcp.tool()
-async def autofigure_start_job(
+async def autofigure_start_await(
     method_text: Optional[str] = None,
     input_figure_path: Optional[str] = None,
     output_dir: Optional[str] = None,
     options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    启动 AutoFigure 异步生成任务。
+    启动 AutoFigure 生成任务并阻塞等待完成。
 
-    该工具会启动一个后台任务，将论文 Method 文本或已有图片转换为
-    学术风格的示意图和可编辑 SVG。
+    将论文 Method 文本或已有图片转换为学术风格的示意图和可编辑 SVG，
+    仅在全流程结束后返回（含 output_dir 与产出文件路径）。
 
     Args:
         method_text: 论文 Method 章节文本内容。与 input_figure_path 二选一。
@@ -249,22 +225,25 @@ async def autofigure_start_job(
             - min_score: SAM 最低置信度，默认 0.5
 
     Returns:
-        包含 job_id 和初始状态的字典：
+        任务完成后的结果字典，例如：
         {
             "job_id": "abc123",
-            "status": "running",
-            "message": "任务已启动"
+            "status": "completed",
+            "output_dir": "/path/to/output/job_abc123",
+            "files": {"figure_png": "...", "final_svg": "..."},
+            "icon_count": 5
         }
+        失败时 status 为 "failed"，并包含 error 字段。
 
     Example:
         # 从 Method 文本生成
-        result = await autofigure_start_job(
+        result = await autofigure_start_await(
             method_text="We propose a novel attention mechanism...",
             options={"sam_prompt": "icon,diagram", "optimize_iterations": 2}
         )
 
         # 从已有图片生成
-        result = await autofigure_start_job(
+        result = await autofigure_start_await(
             input_figure_path="/path/to/figure.png",
             output_dir="/path/to/output"
         )
@@ -301,176 +280,16 @@ async def autofigure_start_job(
     # 更新选项中的输出目录
     job_options["output_dir"] = output_dir
 
-    # 启动后台任务
-    asyncio.create_task(_run_autofigure_job(job_id, job_options))
-
-    return {
-        "job_id": job_id,
-        "status": "running",
-        "message": "任务已启动",
-        "output_dir": output_dir,
-    }
-
-
-@mcp.tool()
-async def autofigure_get_job_status(job_id: str) -> Dict[str, Any]:
-    """
-    查询 AutoFigure 任务的状态和进度。
-
-    Args:
-        job_id: 任务 ID（由 autofigure_start_job 返回）
-
-    Returns:
-        任务状态字典：
-        {
-            "job_id": "abc123",
-            "status": "running",  # pending/running/completed/failed/cancelled
-            "progress": 50,       # 0-100
-            "current_step": "segmenting",  # 当前步骤名称
-            "error": null,        # 错误信息（如有）
-            "created_at": "2024-01-01T12:00:00",
-            "updated_at": "2024-01-01T12:05:00"
-        }
-
-    步骤说明:
-        - initializing: 初始化
-        - generating_figure: 生成学术图片
-        - segmenting: SAM 分割检测图标
-        - cropping: 裁切和去背景
-        - generating_svg: 生成 SVG 模板
-        - optimizing_svg: 优化 SVG
-        - replacing_icons: 替换图标
-        - finalizing: 整理输出
-    """
-    job = job_manager.get_job(job_id)
-    if not job:
-        return {
-            "error": f"Job {job_id} 不存在",
-            "status": "not_found"
-        }
-
-    # 返回状态（不包含 result，减少数据量）
-    status = _effective_job_status(job)
-    return {
-        "job_id": job["job_id"],
-        "status": status,
-        "progress": job["progress"],
-        "current_step": job.get("current_step", ""),
-        "error": job.get("error"),
-        "created_at": job["created_at"],
-        "updated_at": job["updated_at"],
-    }
-
-
-@mcp.tool()
-async def autofigure_get_artifacts(job_id: str) -> Dict[str, Any]:
-    """
-    获取 AutoFigure 任务的生成结果文件路径。
-
-    只有在任务状态为 completed 时才能获取结果。
-
-    Args:
-        job_id: 任务 ID
-
-    Returns:
-        结果文件字典：
-        {
-            "status": "completed",
-            "files": {
-                "figure_png": "/path/to/figure.png",
-                "samed_png": "/path/to/samed.png",
-                "boxlib_json": "/path/to/boxlib.json",
-                "template_svg": "/path/to/template.svg",
-                "optimized_template_svg": "/path/to/optimized_template.svg",
-                "final_svg": "/path/to/final.svg",
-                "icons_dir": "/path/to/icons/"
-            },
-            "icon_count": 5,
-            "output_dir": "/path/to/output/"
-        }
-
-    文件说明:
-        - figure.png: 原始生成的学术示意图
-        - samed.png: 标记了检测框的图片
-        - boxlib.json: 检测框坐标信息
-        - template.svg: LLM 生成的 SVG 模板
-        - optimized_template.svg: 优化后的 SVG 模板
-        - final.svg: 最终完成的 SVG（图标已嵌入）
-        - icons/: 裁切并去背景的图标目录
-    """
-    job = job_manager.get_job(job_id)
-    if not job:
-        return {
-            "error": f"Job {job_id} 不存在",
-            "status": "not_found"
-        }
-
-    status = _effective_job_status(job)
-    if status != "completed":
-        return {
-            "status": status,
-            "error": f"任务尚未完成，当前状态: {status}",
-            "progress": job["progress"],
-        }
-
-    result = job.get("result") or {}
-    return {
-        "status": "completed",
-        "files": result.get("files", {}),
-        "icon_count": result.get("icon_count", 0),
-        "output_dir": result.get("output_dir", ""),
-        "no_icon_mode": result.get("no_icon_mode", False),
-    }
-
-
-@mcp.tool()
-async def autofigure_list_jobs(
-    status: Optional[str] = None,
-    limit: int = 20
-) -> Dict[str, Any]:
-    """
-    列出所有 AutoFigure 任务。
-
-    Args:
-        status: 可选的状态过滤（pending/running/completed/failed/cancelled）
-        limit: 返回数量限制，默认 20
-
-    Returns:
-        任务列表：
-        {
-            "jobs": [
-                {"job_id": "abc123", "status": "completed", "progress": 100, ...},
-                ...
-            ],
-            "total": 5,
-            "filtered_by": "completed"
-        }
-    """
-    jobs = job_manager.list_jobs(status=status)
-    jobs = jobs[:limit]
-    return {
-        "jobs": [
-            {
-                "job_id": j["job_id"],
-                "status": j["status"],
-                "progress": j["progress"],
-                "current_step": j.get("current_step", ""),
-                "created_at": j["created_at"],
-            }
-            for j in jobs
-        ],
-        "total": len(jobs),
-        "filtered_by": status,
-    }
+    return await _run_autofigure_job(job_id, job_options)
 
 
 # ============================================================================
 # 后台任务执行
 # ============================================================================
 
-async def _run_autofigure_job(job_id: str, options: Dict[str, Any]) -> None:
+async def _run_autofigure_job(job_id: str, options: Dict[str, Any]) -> Dict[str, Any]:
     """
-    后台执行 AutoFigure 完整流程。
+    执行 AutoFigure 完整流程，完成后返回结果字典。
     """
     logger.info(f"Starting AutoFigure job: {job_id}")
 
@@ -568,18 +387,33 @@ async def _run_autofigure_job(job_id: str, options: Dict[str, Any]) -> None:
         icon_infos = result.get("icon_infos", [])
         no_icon_mode = len(icon_infos) == 0
 
-        await update(100, "completed", status="completed", result={
+        result_payload = {
             "files": files,
             "icon_count": len(icon_infos),
             "output_dir": output_dir,
             "no_icon_mode": no_icon_mode,
-        })
+        }
+        await update(100, "completed", status="completed", result=result_payload)
 
         logger.info(f"Job {job_id} completed successfully. Output: {output_dir}")
 
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "message": "任务已完成",
+            **result_payload,
+        }
+
     except Exception as e:
         logger.exception(f"Job {job_id} failed: {e}")
+        output_dir = options.get("output_dir", str(_PROJECT_ROOT / "output" / f"job_{job_id}"))
         await update(progress=0, step="failed", status="failed", error=str(e))
+        return {
+            "job_id": job_id,
+            "status": "failed",
+            "error": str(e),
+            "output_dir": output_dir,
+        }
 
 
 # ============================================================================
